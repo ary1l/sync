@@ -32,7 +32,7 @@ local mm = AshitaCore:GetMemoryManager()
 local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
 
 ------------------------------------------------------------
--- Event: Packet Handling (The "Brain")
+-- Event: Packet Handling
 ------------------------------------------------------------
 ashita.events.register('packet_in', 'packet_logic', function (e)
     if (e.id == 0x28) then
