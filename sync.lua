@@ -1,12 +1,11 @@
--- sync v3.0
+-- Independent Absorb Logic + Engaged-only Debuffs/Steps
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '3.0'
+addon.version = '0.8'
 
 require('common')
 local imgui = require('imgui')
 
--- UI State
 local ui_show = { true }
 local lastTick = 0
 
@@ -24,7 +23,7 @@ local mm = AshitaCore:GetMemoryManager()
 local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
 
 ------------------------------------------------------------
--- Packet Logic 
+-- Packet Logic
 ------------------------------------------------------------
 ashita.events.register('packet_in', 'packet_logic', function (e)
     if (e.id == 0x28) then
@@ -35,7 +34,6 @@ ashita.events.register('packet_in', 'packet_logic', function (e)
 
         for _, c in ipairs(chars) do
             if actorName:lower() == c.name:lower() then
-                -- Track Absorb-TP (275) Success
                 if actionId == 275 then c.last_abs = os.clock() end
             end
         end
@@ -58,11 +56,18 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local mainEngaged = (mainIdx ~= 0 and ent:GetStatus(mainIdx) == 1)
 
     for i, c in ipairs(chars) do
+        -- 1. INDEPENDENT ACTIONS (Absorb-TP)
+        -- This fires even if you are NOT engaged.
+        if c.abs[1] and (now - c.last_abs > 15.0) and (now - c.timer > 2.0) then
+            qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
+            c.timer = now
+        end
+
+        -- 2. ENGAGED-ONLY ACTIONS
         if mainEngaged then
-            -- 1. BASE ENGAGEMENT
             if c.e[1] then qcmd(string.format('/mst %s /attack [t]', c.name)) end
             
-            -- 2. JOB ABILITIES 
+            -- Job Abilities & Debuffs
             if now - c.timer > 2.0 then
                 if c.hs[1] then
                     qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name))
@@ -73,14 +78,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 elseif c.qs[1] then
                     qcmd(string.format('/mst %s /ja "Quick Step" [t]', c.name))
                     c.timer = now
-                end
-            end
-            
-            -- 3. MAGIC ACTIONS (Priority: Absorb-TP > Debuffs)
-            if now - c.timer > 2.5 then
-                if c.abs[1] and (now - c.last_abs > 15.0) then
-                    qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
-                    c.timer = now
                 elseif c.deb[1] and not c.done then
                     qcmd(string.format('/mst %s /ma "%s" [t]', c.name, debuff_list[c.step]))
                     c.step = c.step + 1
@@ -89,7 +86,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 end
             end
         else
-            -- Reset on Disengage
+            -- Reset state on disengage
             c.step = 1
             c.done = false
             if c.e[1] then qcmd(string.format('/mst %s /attack off', c.name)) end
@@ -98,14 +95,12 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 end)
 
 ------------------------------------------------------------
--- UI Rendering
+-- UI Rendering (Stable Table)
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
     if not ui_show[1] then return end
-    
     imgui.SetNextWindowSize({ -1, -1 }, ImGuiCond_Always)
-    if imgui.Begin('Sync 3.0', ui_show, ImGuiWindowFlags_AlwaysAutoResize) then
-        -- Table setup with 8 columns for all features
+    if imgui.Begin('Sync', ui_show, ImGuiWindowFlags_AlwaysAutoResize) then
         if imgui.BeginTable('SyncTable', 8, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
             imgui.TableSetupColumn('Mule'); imgui.TableSetupColumn('F'); imgui.TableSetupColumn('E')
             imgui.TableSetupColumn('HS'); imgui.TableSetupColumn('BS'); imgui.TableSetupColumn('QS')
@@ -130,8 +125,7 @@ ashita.events.register('d3d_present', 'render_ui', function ()
 end)
 
 ashita.events.register('command', 'command_cb', function (e)
-    local args = e.command:args()
-    if #args > 0 and args[1]:any('/sync') then
+    if e.command:args()[1]:any('/sync') then
         e.blocked = true
         ui_show[1] = not ui_show[1]
     end
