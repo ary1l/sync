@@ -1,4 +1,3 @@
--- sync v4.1.3
 addon.name    = 'sync'
 addon.author  = 'aryl'
 addon.version = '0.8'
