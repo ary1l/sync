@@ -154,7 +154,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 -- Auto-disengage reset
                 if not mainEngaged then
                     c.step = 1; c.done = false; c.casting = false
-                    if c.e[1] then qcmd(string.format('/mst %s /attack off', c.name)) end
+                    if c.e[1] then qcmd(string.format('/mst %s /attack', c.name)) end
                 end
             end
         end
