@@ -1,21 +1,28 @@
--- Independent Absorb Logic + Engaged-only Debuffs/Steps
+-- sync v3.2
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '0.8'
+addon.version = '3.2'
 
 require('common')
 local imgui = require('imgui')
 
-local ui_show = { true }
+------------------------------------------------------------
+-- Settings 
+------------------------------------------------------------
+local HS_TP_THRESHOLD   = 350
+local HS_COOLDOWN       = 75
+local STEP_TP_THRESHOLD = 100
+local STEP_COOLDOWN     = 10
+local TICK_INTERVAL     = 0.5
 local lastTick = 0
 
 local chars = {
     { name='muunch',   f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0 },
+      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0 },
     { name='slowpoke', f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0 },
+      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0 },
     { name='goomy',    f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0 },
+      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0 },
 }
 
 local debuff_list = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Paralyze II" }
@@ -33,8 +40,8 @@ ashita.events.register('packet_in', 'packet_logic', function (e)
         if not actorName then return end
 
         for _, c in ipairs(chars) do
-            if actorName:lower() == c.name:lower() then
-                if actionId == 275 then c.last_abs = os.clock() end
+            if actorName:lower() == c.name:lower() and actionId == 275 then 
+                c.last_abs = os.clock() 
             end
         end
     end
@@ -45,7 +52,7 @@ end)
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function ()
     local now = os.clock()
-    if now - lastTick < 0.5 then return end
+    if now - lastTick < TICK_INTERVAL then return end
     lastTick = now
 
     local ent = mm:GetEntity()
@@ -56,51 +63,65 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local mainEngaged = (mainIdx ~= 0 and ent:GetStatus(mainIdx) == 1)
 
     for i, c in ipairs(chars) do
-        -- 1. INDEPENDENT ACTIONS (Absorb-TP)
-        -- This fires even if you are NOT engaged.
-        if c.abs[1] and (now - c.last_abs > 15.0) and (now - c.timer > 2.0) then
-            qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
-            c.timer = now
-        end
-
-        -- 2. ENGAGED-ONLY ACTIONS
-        if mainEngaged then
-            if c.e[1] then qcmd(string.format('/mst %s /attack [t]', c.name)) end
+        -- Find character's party data
+        local pIdx = nil
+        for x=0,17 do if party:GetMemberName(x):lower() == c.name:lower() then pIdx = x break end end
+        
+        if pIdx then
+            local muleTP = party:GetMemberTP(pIdx)
             
-            -- Job Abilities & Debuffs
-            if now - c.timer > 2.0 then
-                if c.hs[1] then
+            -- 1. INDEPENDENT ACTION: Absorb-TP (Independent of Engagement)
+            if c.abs[1] and (now - c.last_abs > 15.0) and (now - c.timer > 2.0) then
+                qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
+                c.timer = now
+            end
+
+            -- 2. ENGAGED ACTIONS
+            if mainEngaged then
+                if c.e[1] then qcmd(string.format('/mst %s /attack [t]', c.name)) end
+
+                -- Haste Samba (HS) Logic
+                if c.hs[1] and muleTP >= HS_TP_THRESHOLD and (now - c.hs_last > HS_COOLDOWN) then
                     qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name))
+                    c.hs_last = now
                     c.timer = now
-                elseif c.bs[1] then
+                
+                -- Steps Logic (BS / QS)
+                elseif c.bs[1] and muleTP >= STEP_TP_THRESHOLD and (now - c.bs_last > STEP_COOLDOWN) then
                     qcmd(string.format('/mst %s /ja "Box Step" [t]', c.name))
+                    c.bs_last = now
                     c.timer = now
-                elseif c.qs[1] then
+                elseif c.qs[1] and muleTP >= STEP_TP_THRESHOLD and (now - c.qs_last > STEP_COOLDOWN) then
                     qcmd(string.format('/mst %s /ja "Quick Step" [t]', c.name))
+                    c.qs_last = now
                     c.timer = now
-                elseif c.deb[1] and not c.done then
+
+                -- RDM Debuff Sequence
+                elseif c.deb[1] and not c.done and (now - c.timer > 2.5) then
                     qcmd(string.format('/mst %s /ma "%s" [t]', c.name, debuff_list[c.step]))
                     c.step = c.step + 1
                     c.timer = now
                     if c.step > #debuff_list then c.done = true end
                 end
+            else
+                -- Disengage Logic
+                c.step = 1; c.done = false
+                if c.e[1] then qcmd(string.format('/mst %s /attack off', c.name)) end
             end
-        else
-            -- Reset state on disengage
-            c.step = 1
-            c.done = false
-            if c.e[1] then qcmd(string.format('/mst %s /attack off', c.name)) end
+            
+            -- Follow Sync (from 0.4)
+            qcmd(string.format('/mst %s /ms follow %s', c.name, c.f[1] and 'on' or 'off'))
         end
     end
 end)
 
 ------------------------------------------------------------
--- UI Rendering (Stable Table)
+-- UI Rendering
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
     if not ui_show[1] then return end
     imgui.SetNextWindowSize({ -1, -1 }, ImGuiCond_Always)
-    if imgui.Begin('Sync', ui_show, ImGuiWindowFlags_AlwaysAutoResize) then
+    if imgui.Begin('Sync 3.2', ui_show, ImGuiWindowFlags_AlwaysAutoResize) then
         if imgui.BeginTable('SyncTable', 8, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
             imgui.TableSetupColumn('Mule'); imgui.TableSetupColumn('F'); imgui.TableSetupColumn('E')
             imgui.TableSetupColumn('HS'); imgui.TableSetupColumn('BS'); imgui.TableSetupColumn('QS')
