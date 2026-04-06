@@ -2,7 +2,7 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
 addon.version = '2.0'
-addon.desc    = 'Aminon-Safe TP Control (No Auto-Refresh)'
+addon.desc    = 'multisend leverager'
 
 require('common')
 local imgui = require('imgui')
