@@ -62,7 +62,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             -- 1. BASE ENGAGEMENT
             if c.e[1] then qcmd(string.format('/mst %s /attack [t]', c.name)) end
             
-            -- 2. JOB ABILITIES (DNC Utility from 0.4)
+            -- 2. JOB ABILITIES 
             if now - c.timer > 2.0 then
                 if c.hs[1] then
                     qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name))
@@ -98,7 +98,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 end)
 
 ------------------------------------------------------------
--- UI Rendering (v2.5 Aesthetic Table)
+-- UI Rendering
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
     if not ui_show[1] then return end
