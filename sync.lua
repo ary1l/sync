@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '1.0.3' 
+addon.version = '0.3' 
 
 require('common')
 local imgui = require('imgui')
@@ -171,7 +171,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 end)
 
 ------------------------------------------------------------
--- UI Rendering (Standard 1.0.0 Layout)
+-- UI Rendering
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
     if not ui_show[1] then return end
