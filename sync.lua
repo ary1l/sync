@@ -19,11 +19,11 @@ local debuff_list = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slo
 local spell_mp    = { ["Dia III"]=45, ["Frazzle III"]=90, ["Distract III"]=84, ["Blind II"]=31, ["Slow II"]=45, ["Paralyze II"]=36, ["Absorb-TP"]=33 }
 
 local chars = {
-    { name='muunch',   f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
+    { name='',   f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
       step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
-    { name='slowpoke', f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
+    { name='', f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
       step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
-    { name='goomy',    f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
+    { name='',    f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
       step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
 }
 
