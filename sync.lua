@@ -1,61 +1,87 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '0.3' 
+addon.version = '2.3.5' 
 
 require('common')
 local imgui = require('imgui')
 
--- Logic Constants
-local HS_TP_THRESHOLD   = 350
-local HS_COOLDOWN       = 85
-local STEP_TP_THRESHOLD = 100
-local STEP_COOLDOWN     = 10
-local ABS_COOLDOWN      = 15 
-local TICK_INTERVAL     = 0.3 
-local lastTick          = 0
-
-local ui_show = { true }
-local debuff_list = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
-local spell_mp    = { ["Dia III"]=45, ["Frazzle III"]=90, ["Distract III"]=84, ["Blind II"]=31, ["Slow II"]=45, ["Paralyze II"]=36, ["Absorb-TP"]=33 }
-
+------------------------------------------------------------
+-- CONFIGURATION
+------------------------------------------------------------
 local chars = {
-    { name='',   f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
-    { name='', f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
-    { name='',    f={true}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, 
-      step=1, done=false, timer=0, last_abs=0, hs_last=0, bs_last=0, qs_last=0, last_f_state=nil, deb_last=0, last_target_id=0, casting=false, cast_start=0, disengage_sent=0 },
+    { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='slowpoke', f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='goomy',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
+
+local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [15]=true, [16]=true, [21]=true }
+local RDM_INDEX = 4 
+local TICK_INTERVAL = 0.5
+local lastTick = os.clock() 
+local CAST_LOCK = 5.2 
+local whm_present = false 
+
+for _, c in ipairs(chars) do
+    c.f_prev, c.e_prev = c.f[1], c.e[1]
+    c.step, c.done, c.action_lock = 1, false, 0
+    c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
+    c.buffs = {} 
+    c.last_cast = {} 
+    c.job = 0 
+    c.pIdx = -1 
+    c.engaged_target = 0 
+end
 
 local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
 
 ------------------------------------------------------------
--- Event: Packet Handling
+-- HELPERS
+------------------------------------------------------------
+local function get_effective_target()
+    local targ = AshitaCore:GetMemoryManager():GetTarget()
+    local ent = AshitaCore:GetMemoryManager():GetEntity()
+    if not targ or not ent then return 0 end
+    local tIdx = targ:GetTargetIndex(targ:GetIsSubTargetActive())
+    if tIdx == 0 then return 0 end
+    local target_ent = ent:GetRawEntity(tIdx)
+    if target_ent and target_ent.SpawnType == 0 then 
+        local totIdx = ent:GetTargetedIndex(tIdx)
+        if totIdx ~= 0 then return totIdx end
+    end
+    return tIdx
+end
+
+------------------------------------------------------------
+-- PACKET TRACKING (0x076)
 ------------------------------------------------------------
 ashita.events.register('packet_in', 'packet_logic', function (e)
-    if (e.id == 0x28) then
-        local mm = AshitaCore:GetMemoryManager(); local ent = mm and mm:GetEntity()
-        if not ent then return end
-
-        local userId   = ashita.bits.unpack_be(e.data_raw, 0, 40, 32)
-        local category = ashita.bits.unpack_be(e.data_raw, 0, 82, 4)
-        local actorId  = bit.band(userId, 0x7FF); local actorName = ent:GetName(actorId)
-        
-        if not actorName then return end
-
-        for _, c in ipairs(chars) do
-            if actorName:lower() == c.name:lower() then
-                if category == 4 or category == 6 or category == 14 then 
-                    if c.casting then
-                        c.casting = false
-                        if c.deb[1] and not c.abs[1] then
-                            c.step = c.step + 1
-                            if c.step > #debuff_list then c.done = true end
+    if (e.id == 0x076) then
+        local party = AshitaCore:GetMemoryManager():GetParty()
+        if not party then return end
+        for x = 0, 4 do
+            local offset = x * 0x30
+            local server_id = struct.unpack('I', e.data, offset + 0x04 + 1)
+            if server_id and server_id > 0 then
+                for p = 0, 5 do
+                    if party:GetMemberIsActive(p) == 1 and party:GetMemberServerId(p) == server_id then
+                        local rawName = party:GetMemberName(p)
+                        if rawName then
+                            local target_name = rawName:lower()
+                            for _, c in ipairs(chars) do
+                                if target_name == c.name:lower() then
+                                    local current_buffs = {}
+                                    for i = 0, 31 do
+                                        local mask = bit.band(bit.rshift(struct.unpack('b', e.data, bit.rshift(i, 2) + (offset + 0x0C) + 1), 2 * (i % 4)), 3)
+                                        local buffId = bit.bor(struct.unpack('B', e.data, (offset + 0x14) + i + 1), bit.lshift(mask, 8))
+                                        if buffId ~= 255 and buffId > 0 then current_buffs[buffId] = true end
+                                    end
+                                    c.buffs = current_buffs
+                                    break
+                                end
+                            end
                         end
-                        c.timer = os.clock() + 0.8
                     end
-                elseif category == 8 or category == 12 then 
-                    c.casting = false; c.timer = os.clock() + 1.5 
                 end
             end
         end
@@ -63,7 +89,53 @@ ashita.events.register('packet_in', 'packet_logic', function (e)
 end)
 
 ------------------------------------------------------------
--- Event: Main Logic Loop
+-- CASTING LOGIC
+------------------------------------------------------------
+local function try_cast(command, caster, target_char, buff_id, now, lock_time, retry_delay)
+    if not target_char.buffs[buff_id] then
+        if not target_char.last_cast[buff_id] or (now - target_char.last_cast[buff_id] > retry_delay) then
+            qcmd(command)
+            target_char.last_cast[buff_id] = now
+            caster.action_lock = now + lock_time
+            return true
+        end
+    end
+    return false
+end
+
+local function handle_surgical_buffs(caster, now)
+    -- 1. Composure (Always)
+    if try_cast(string.format('/mst %s /ja "Composure" <me>', caster.name), caster, caster, 419, now, 2.0, 300) then return true end
+
+    -- 2. Haste II Priority (Now checked for all with "Bu" checked)
+    for _, c in ipairs(chars) do
+        if c.buf[1] then
+            if try_cast(string.format('/mst %s /ma "Haste II" %s', caster.name, c.name), caster, c, 33, now, CAST_LOCK, 15) then return true end
+        end
+    end
+
+    -- 3. Self Buffs (Goomy)
+    if caster.buf[1] then
+        if try_cast(string.format('/mst %s /ma "Phalanx" <me>', caster.name), caster, caster, 116, now, CAST_LOCK, 15) then return true end
+        if try_cast(string.format('/mst %s /ma "Temper II" <me>', caster.name), caster, caster, 432, now, CAST_LOCK, 300) then return true end
+    end
+
+    -- 4. Utility Buffs
+    for _, c in ipairs(chars) do
+        if c.buf[1] then
+            if REFRESH_JOBS[c.job] and try_cast(string.format('/mst %s /ma "Refresh III" %s', caster.name, c.name), caster, c, 43, now, CAST_LOCK, 15) then return true end
+            if c.name ~= caster.name and try_cast(string.format('/mst %s /ma "Phalanx II" %s', caster.name, c.name), caster, c, 116, now, CAST_LOCK, 15) then return true end
+            if not whm_present then
+                if try_cast(string.format('/mst %s /ma "Protect V" %s', caster.name, c.name), caster, c, 40, now, CAST_LOCK, 120) then return true end
+                if try_cast(string.format('/mst %s /ma "Shell V" %s', caster.name, c.name), caster, c, 41, now, CAST_LOCK, 120) then return true end
+            end
+        end
+    end
+    return false
+end
+
+------------------------------------------------------------
+-- CORE LOOP
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function ()
     local now = os.clock()
@@ -72,136 +144,137 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 
     local mm = AshitaCore:GetMemoryManager()
     if not mm or mm:GetPlayer():GetIsZoning() ~= 0 then return end
+    
+    local party, player, ent = mm:GetParty(), mm:GetPlayer(), mm:GetEntity()
+    local caster = chars[RDM_INDEX]
+    local effectiveTarget = get_effective_target()
+    local leaderTIdx = party:GetMemberTargetIndex(0)
+    local leaderStatus = (leaderTIdx ~= 0) and ent:GetStatus(leaderTIdx) or 0
+    local mainEngaged = (leaderStatus == 1 or effectiveTarget ~= 0)
 
-    -- 1. FOLLOW LOGIC (No target needed)
-    for _, c in ipairs(chars) do
-        if c.f[1] ~= c.last_f_state then
-            qcmd(string.format('/mst %s /ms follow %s', c.name, c.f[1] and 'on' or 'off'))
-            c.last_f_state = c.f[1]
-        end
-    end
+    -- Buff Sync (0=Leader)
+    whm_present = false
+    for p = 0, 5 do
+        if party:GetMemberIsActive(p) == 1 then
+            local rawName = party:GetMemberName(p)
+            if rawName then
+                local pName = rawName:lower()
+                local pJob = party:GetMemberMainJob(p)
+                if pJob == 3 then whm_present = true end 
 
-    -- 2. TARGET & PARTY DATA
-    local ent, party, targ = mm:GetEntity(), mm:GetParty(), mm:GetTarget()
-    if not ent or not party or not targ then return end
-
-    local subActive = targ:GetIsSubTargetActive()
-    local tIndex    = targ:GetTargetIndex(subActive)
-    local tID       = (tIndex ~= 0) and ent:GetServerId(tIndex) or 0
-    local tHP       = (tIndex ~= 0) and ent:GetHPPercent(tIndex) or 0
-    local mainIdx   = party:GetMemberTargetIndex(0)
-    local mainEngaged = (mainIdx ~= 0 and ent:GetStatus(mainIdx) == 1)
-
-    local partyMap = {}
-    for x = 0, 17 do 
-        local mName = party:GetMemberName(x)
-        if mName then partyMap[mName:lower()] = x end 
-    end
-
-    for _, c in ipairs(chars) do
-        local pIdx = partyMap[c.name:lower()]
-        if pIdx then
-            local muleTP = party:GetMemberTP(pIdx)
-            local muleMP = party:GetMemberMP(pIdx)
-            local mIdx   = party:GetMemberTargetIndex(pIdx)
-            local muleEngaged = (mIdx ~= 0 and ent:GetStatus(mIdx) == 1)
-            local distSq = (mIdx ~= 0 and tIndex ~= 0) and ent:GetDistance(mIdx, tIndex) or 1000
-
-            -- RESET LOGIC
-            if not mainEngaged or tID == 0 or tHP <= 0 or (tID ~= c.last_target_id) then
-                if c.last_target_id ~= tID or not mainEngaged then
-                    c.step = 1; c.done = false; c.casting = false; c.last_target_id = tID; c.deb_last = 0
-                end
-            end
-
-            -- ENGAGE / DISENGAGE
-            if (not c.e[1] or not mainEngaged or tID == 0 or tHP <= 0) then
-                if muleEngaged and (now - c.disengage_sent > 2.0) then
-                    qcmd(string.format('/mst %s /attack off', c.name)); c.disengage_sent = now
-                end
-            elseif c.e[1] and mainEngaged and tID ~= 0 and tHP > 5 then
-                if not muleEngaged and distSq < 100 then -- Only engage if within 10 yalms
-                    qcmd(string.format('/mst %s /attack [t]', c.name)); c.disengage_sent = 0 
-                end
-            end
-
-            -- COMBAT & DEBUFFS
-            if mainEngaged and tID ~= 0 and tHP > 5 and distSq < 441 then -- 21 yalms max range
-                if not c.deb[1] and not c.abs[1] then c.casting = false end
-
-                if now > c.timer and not c.casting then 
-                    -- Haste Samba
-                    if c.hs[1] and muleTP >= HS_TP_THRESHOLD and (now - c.hs_last > HS_COOLDOWN) then
-                        qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name))
-                        c.hs_last = now; c.timer = now + 1.8
-                    
-                    -- Absorb-TP (Check MP)
-                    elseif c.abs[1] and muleMP >= 33 and (now - c.last_abs > ABS_COOLDOWN) then
-                        qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
-                        c.last_abs = now; c.cast_start = now; c.casting = true; c.timer = now + 1.0
-                    
-                    -- Debuffs (Check MP)
-                    elseif c.deb[1] and not c.done then
-                        local spell = debuff_list[c.step]
-                        if (now - c.deb_last > 1.5) and muleMP >= (spell_mp[spell] or 0) then
-                            qcmd(string.format('/mst %s /ma "%s" [t]', c.name, spell))
-                            c.deb_last = now; c.cast_start = now; c.casting = true; c.timer = now + 1.0
+                for _, c in ipairs(chars) do
+                    if pName == c.name:lower() then
+                        c.job = pJob
+                        c.pIdx = p 
+                        if p == 0 then 
+                            local current_buffs = {}
+                            local pBuffs = player:GetBuffs()
+                            for j = 0, 31 do
+                                local b = pBuffs[j]
+                                if b and b > 0 and b ~= 255 then current_buffs[b] = true end
+                            end
+                            c.buffs = current_buffs
                         end
-                    
-                    -- Steps
-                    elseif c.bs[1] and muleTP >= STEP_TP_THRESHOLD and (now - c.bs_last > STEP_COOLDOWN) then
-                        qcmd(string.format('/mst %s /ja "Box Step" [t]', c.name))
-                        c.bs_last = now; c.timer = now + 1.5
-                    elseif c.qs[1] and muleTP >= STEP_TP_THRESHOLD and (now - c.qs_last > STEP_COOLDOWN) then
-                        qcmd(string.format('/mst %s /ja "Quick Step" [t]', c.name))
-                        c.qs_last = now; c.timer = now + 1.5
+                        break
                     end
                 end
             end
+        end
+    end
 
-            -- Casting Failsafe
-            if c.casting and (now - c.cast_start > 8.0) then
-                c.casting = false
-                if c.deb[1] and not c.abs[1] then
-                    c.step = c.step + 1; if c.step > #debuff_list then c.done = true end
+    -- Logic for Follow and Attack
+    for i, c in ipairs(chars) do
+        if i ~= 1 and c.pIdx ~= -1 then
+            if c.f[1] ~= c.f_prev then
+                qcmd(string.format('/mst %s /ms follow %s', c.name, c.f[1] and 'on' or 'off'))
+                c.f_prev = c.f[1]
+            end
+            
+            if c.e[1] then 
+                if mainEngaged then
+                    if c.engaged_target ~= effectiveTarget then
+                        qcmd(string.format('/mst %s /attack [t]', c.name))
+                        c.engaged_target = effectiveTarget
+                    end
+                elseif c.engaged_target ~= 0 then
+                    qcmd(string.format('/mst %s /attack off', c.name))
+                    c.engaged_target = 0
+                end
+            elseif c.engaged_target ~= 0 then
+                qcmd(string.format('/mst %s /attack off', c.name))
+                c.engaged_target = 0
+            end
+        end
+    end
+
+    -- Main RDM Loop
+    if now > caster.action_lock then
+        if mainEngaged and caster.deb[1] and not caster.done and now > caster.deb_last + 2.5 then
+            local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
+            local s = debuffs[caster.step]
+            if s then 
+                qcmd(string.format('/mst %s /ma "%s" [t]', caster.name, s))
+                caster.deb_last = now; caster.action_lock = now + CAST_LOCK; caster.step = caster.step + 1 
+            else caster.done = true end
+        else
+            handle_surgical_buffs(caster, now)
+        end
+    end
+
+    -- Independent Mule JA/MA
+    for i, c in ipairs(chars) do
+        if i ~= 1 and i ~= RDM_INDEX and now > c.action_lock and c.pIdx ~= -1 then
+            local tp, mp = party:GetMemberTP(c.pIdx), party:GetMemberMP(c.pIdx)
+            
+            if c.abs[1] and mp >= 33 and now > c.abs_last + 15 then
+                qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
+                c.abs_last = now; c.action_lock = now + 4.0
+            elseif mainEngaged then
+                if c.hs[1] and tp >= 350 and now > c.hs_last + 85 then
+                    qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name)); c.hs_last = now; c.action_lock = now + 2.0
+                elseif c.bs[1] and tp >= 100 and now > c.step_last + 10 then
+                    qcmd(string.format('/mst %s /ja "Box Step" [t]', c.name)); c.step_last = now; c.action_lock = now + 2.0
+                elseif c.qs[1] and tp >= 100 and now > c.step_last + 10 then
+                    qcmd(string.format('/mst %s /ja "Quick Step" [t]', c.name)); c.step_last = now; c.action_lock = now + 2.0
                 end
             end
         end
     end
+
+    if not mainEngaged then caster.step, caster.done = 1, false end
 end)
 
 ------------------------------------------------------------
--- UI Rendering
+-- UI
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
-    if not ui_show[1] then return end
-    if imgui.Begin('Sync 1.0.3', ui_show, ImGuiWindowFlags_AlwaysAutoResize) then
-        if imgui.BeginTable('SyncTable', 8, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
-            imgui.TableSetupColumn('Mule'); imgui.TableSetupColumn('F'); imgui.TableSetupColumn('E')
-            imgui.TableSetupColumn('HS'); imgui.TableSetupColumn('BS'); imgui.TableSetupColumn('QS')
-            imgui.TableSetupColumn('Abs'); imgui.TableSetupColumn('Deb')
+    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {2, 2}); imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {2, 2})
+    if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
+        if imgui.BeginTable('T', 9, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
+            imgui.TableSetupColumn('Name', 0, 50); imgui.TableSetupColumn('F', 0, 18); imgui.TableSetupColumn('E', 0, 18)
+            imgui.TableSetupColumn('HS', 0, 18); imgui.TableSetupColumn('BS', 0, 18); imgui.TableSetupColumn('QS', 0, 18)
+            imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
             imgui.TableHeadersRow()
             for i, c in ipairs(chars) do
-                imgui.TableNextRow()
-                imgui.TableNextColumn(); imgui.Text(c.name:upper())
-                imgui.TableNextColumn(); imgui.Checkbox('##F'..i, c.f)
-                imgui.TableNextColumn(); imgui.Checkbox('##E'..i, c.e)
-                imgui.TableNextColumn(); imgui.Checkbox('##HS'..i, c.hs)
-                imgui.TableNextColumn(); imgui.Checkbox('##BS'..i, c.bs)
-                imgui.TableNextColumn(); imgui.Checkbox('##QS'..i, c.qs)
-                imgui.TableNextColumn(); imgui.Checkbox('##Abs'..i, c.abs)
-                imgui.TableNextColumn(); imgui.Checkbox('##Deb'..i, c.deb)
+                imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:upper())
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##BS'..i, c.bs) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); if i == 4 then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
+                imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
             end
             imgui.EndTable()
         end
         imgui.End()
     end
+    imgui.PopStyleVar(2)
 end)
 
-ashita.events.register('load', 'sync_load', function() qcmd('/ms followme on') end)
-ashita.events.register('command', 'command_cb', function (e)
-    local args = e.command:args()
-    if #args > 0 and args[1]:lower() == '/sync' then
-        e.blocked = true; ui_show[1] = not ui_show[1]
-    end
+ashita.events.register('load','sync_load',function()
+    qcmd('/ms followme on')
+    local now = os.clock()
+    chars[RDM_INDEX].last_cast[419] = now - 290 
 end)
