@@ -107,14 +107,14 @@ local function handle_surgical_buffs(caster, now)
     -- 1. Composure (Always)
     if try_cast(string.format('/mst %s /ja "Composure" <me>', caster.name), caster, caster, 419, now, 2.0, 300) then return true end
 
-    -- 2. Haste II Priority (Now checked for all with "Bu" checked)
+    -- 2. Haste II Priority
     for _, c in ipairs(chars) do
         if c.buf[1] then
             if try_cast(string.format('/mst %s /ma "Haste II" %s', caster.name, c.name), caster, c, 33, now, CAST_LOCK, 15) then return true end
         end
     end
 
-    -- 3. Self Buffs (Goomy)
+    -- 3. Self Buffs
     if caster.buf[1] then
         if try_cast(string.format('/mst %s /ma "Phalanx" <me>', caster.name), caster, caster, 116, now, CAST_LOCK, 15) then return true end
         if try_cast(string.format('/mst %s /ma "Temper II" <me>', caster.name), caster, caster, 432, now, CAST_LOCK, 300) then return true end
