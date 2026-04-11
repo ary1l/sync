@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '0.4.3' 
+addon.version = '0.4.6' 
 
 require('common')
 local imgui = require('imgui')
@@ -8,11 +8,12 @@ local imgui = require('imgui')
 ------------------------------------------------------------
 -- CONFIGURATION & CACHE
 ------------------------------------------------------------
+local show_ui = true
 local chars = {
-    { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='slowpoke', f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='goomy',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='shaymin',  is_guest=false, active=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='muunch',   is_guest=false, active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='slowpoke', is_guest=false, active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='goomy',    is_guest=false, active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
 local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [15]=true, [16]=true, [21]=true }
@@ -37,6 +38,17 @@ end
 local chatManager = AshitaCore:GetChatManager()
 local memManager = AshitaCore:GetMemoryManager()
 local qcmd = function(cmd) chatManager:QueueCommand(1, cmd) end
+
+------------------------------------------------------------
+-- COMMAND HANDLER
+------------------------------------------------------------
+ashita.events.register('command', 'command_logic', function (e)
+    local args = e.command:args()
+    if #args > 0 and args[1]:lower() == '/sync' then
+        show_ui = not show_ui
+        e.blocked = true
+    end
+end)
 
 ------------------------------------------------------------
 -- HELPERS
@@ -174,26 +186,29 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local party, player, ent = memManager:GetParty(), memManager:GetPlayer(), memManager:GetEntity()
     local caster = chars[RDM_INDEX]
     
-    -- Engagement Logic Fix
     local leaderTIdx = party:GetMemberTargetIndex(0)
     local leaderStatus = (leaderTIdx ~= 0) and ent:GetStatus(leaderTIdx) or 0
-    local leaderHP = (leaderTIdx ~= 0) and ent:GetHPPercent(leaderTIdx) or 0
     
-    -- "MainEngaged" is now strictly defined as the leader being in combat (Status 1) and alive
-    local mainEngaged = (leaderStatus == 1 and leaderHP > 0)
+    local mainEngaged = (leaderStatus == 1)
     local effectiveTarget = get_effective_target()
 
-    -- Sync party data/buffs
+    for _, c in ipairs(chars) do 
+        if c.is_guest then c.active = false end 
+    end
+
     for p = 0, 5 do
         if party:GetMemberIsActive(p) == 1 then
             local rawName = party:GetMemberName(p)
             if rawName then
                 local pName = rawName:lower()
                 local pJob = party:GetMemberMainJob(p)
+                local found = false
+                
                 for _, c in ipairs(chars) do
                     if pName == c.name_lower then
                         c.job = pJob
                         c.pIdx = p 
+                        c.active = true
                         if p == 0 then 
                             local current_buffs = {}
                             local pBuffs = player:GetBuffs()
@@ -203,16 +218,33 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                             end
                             c.buffs = current_buffs
                         end
+                        found = true
                         break
                     end
+                end
+                
+                if not found then
+                    local new_guest = {
+                        name = rawName, name_lower = pName, is_guest = true, active = true,
+                        f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false},
+                        f_prev=false, e_prev=false,
+                        step=1, done=false, action_lock=0, hs_last=0, step_last=0, abs_last=0, deb_last=0,
+                        buffs={}, last_cast={}, job=pJob, pIdx=p, engaged_target=0
+                    }
+                    table.insert(chars, new_guest)
                 end
             end
         end
     end
 
-    -- Logic for Follow and Attack
+    for i = #chars, 1, -1 do
+        if chars[i].is_guest and not chars[i].active then
+            table.remove(chars, i)
+        end
+    end
+
     for i, c in ipairs(chars) do
-        if i ~= 1 and c.pIdx ~= -1 then
+        if not c.is_guest and i ~= 1 and c.pIdx ~= -1 then
             if c.f[1] ~= c.f_prev then
                 qcmd(string.format('/mst %s /ms follow %s', c.name, c.f[1] and 'on' or 'off'))
                 c.f_prev = c.f[1]
@@ -220,7 +252,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             
             if c.e[1] then 
                 if mainEngaged then
-                    -- Only send attack command if the target index has actually changed
                     if c.engaged_target ~= effectiveTarget then
                         qcmd(string.format('/mst %s /attack [t]', c.name))
                         c.engaged_target = effectiveTarget
@@ -236,7 +267,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
-    -- Main RDM Loop (Only runs if MainEngaged is true for debuffs)
     if now > caster.action_lock then
         if mainEngaged and caster.deb[1] and not caster.done and now > caster.deb_last + 2.5 then
             local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
@@ -250,9 +280,8 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
-    -- Independent Mule JA/MA
     for i, c in ipairs(chars) do
-        if i ~= 1 and i ~= RDM_INDEX and now > c.action_lock and c.pIdx ~= -1 then
+        if not c.is_guest and i ~= 1 and i ~= RDM_INDEX and now > c.action_lock and c.pIdx ~= -1 then
             local tp, mp = party:GetMemberTP(c.pIdx), party:GetMemberMP(c.pIdx)
             
             if c.abs[1] and mp >= 33 and now > c.abs_last + 15 then
@@ -277,6 +306,7 @@ end)
 -- UI
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'render_ui', function ()
+    if not show_ui then return end
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {2, 2}); imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {2, 2})
     if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
         if imgui.BeginTable('T', 9, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
@@ -285,15 +315,17 @@ ashita.events.register('d3d_present', 'render_ui', function ()
             imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
             imgui.TableHeadersRow()
             for i, c in ipairs(chars) do
-                imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:upper())
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##BS'..i, c.bs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i == 4 then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
+                if c.active then
+                    imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:upper())
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##BS'..i, c.bs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if not c.is_guest and i == RDM_INDEX then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
+                end
             end
             imgui.EndTable()
         end
