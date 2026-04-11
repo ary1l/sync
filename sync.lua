@@ -1,12 +1,12 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.5' 
+addon.version = '0.4.3' 
 
 require('common')
 local imgui = require('imgui')
 
 ------------------------------------------------------------
--- CONFIGURATION
+-- CONFIGURATION & CACHE
 ------------------------------------------------------------
 local chars = {
     { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
@@ -19,10 +19,11 @@ local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [15]=true, [16]=t
 local RDM_INDEX = 4 
 local TICK_INTERVAL = 0.5
 local lastTick = os.clock() 
+local zone_lock = os.clock() + 3.0 
 local CAST_LOCK = 5.2 
-local whm_present = false 
 
 for _, c in ipairs(chars) do
+    c.name_lower = c.name:lower()
     c.f_prev, c.e_prev = c.f[1], c.e[1]
     c.step, c.done, c.action_lock = 1, false, 0
     c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
@@ -33,14 +34,16 @@ for _, c in ipairs(chars) do
     c.engaged_target = 0 
 end
 
-local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
+local chatManager = AshitaCore:GetChatManager()
+local memManager = AshitaCore:GetMemoryManager()
+local qcmd = function(cmd) chatManager:QueueCommand(1, cmd) end
 
 ------------------------------------------------------------
 -- HELPERS
 ------------------------------------------------------------
 local function get_effective_target()
-    local targ = AshitaCore:GetMemoryManager():GetTarget()
-    local ent = AshitaCore:GetMemoryManager():GetEntity()
+    local targ = memManager:GetTarget()
+    local ent = memManager:GetEntity()
     if not targ or not ent then return 0 end
     local tIdx = targ:GetTargetIndex(targ:GetIsSubTargetActive())
     if tIdx == 0 then return 0 end
@@ -57,7 +60,7 @@ end
 ------------------------------------------------------------
 ashita.events.register('packet_in', 'packet_logic', function (e)
     if (e.id == 0x076) then
-        local party = AshitaCore:GetMemoryManager():GetParty()
+        local party = memManager:GetParty()
         if not party then return end
         for x = 0, 4 do
             local offset = x * 0x30
@@ -69,7 +72,7 @@ ashita.events.register('packet_in', 'packet_logic', function (e)
                         if rawName then
                             local target_name = rawName:lower()
                             for _, c in ipairs(chars) do
-                                if target_name == c.name:lower() then
+                                if target_name == c.name_lower then
                                     local current_buffs = {}
                                     for i = 0, 31 do
                                         local mask = bit.band(bit.rshift(struct.unpack('b', e.data, bit.rshift(i, 2) + (offset + 0x0C) + 1), 2 * (i % 4)), 3)
@@ -91,44 +94,63 @@ end)
 ------------------------------------------------------------
 -- CASTING LOGIC
 ------------------------------------------------------------
-local function try_cast(command, caster, target_char, buff_id, now, lock_time, retry_delay)
+local function check_buff_needed(target_char, buff_id, now, retry_delay)
     if not target_char.buffs[buff_id] then
         if not target_char.last_cast[buff_id] or (now - target_char.last_cast[buff_id] > retry_delay) then
-            qcmd(command)
-            target_char.last_cast[buff_id] = now
-            caster.action_lock = now + lock_time
             return true
         end
     end
     return false
 end
 
-local function handle_surgical_buffs(caster, now)
-    -- 1. Composure (Always)
-    if try_cast(string.format('/mst %s /ja "Composure" <me>', caster.name), caster, caster, 419, now, 2.0, 300) then return true end
+local function try_cast(command, caster, target_char, buff_id, now, lock_time, retry_delay)
+    if check_buff_needed(target_char, buff_id, now, retry_delay) then
+        qcmd(command)
+        target_char.last_cast[buff_id] = now
+        caster.action_lock = now + lock_time
+        return true
+    end
+    return false
+end
 
-    -- 2. Haste II Priority
+local function handle_buffs(caster, now)
+    local buff_needed = false
+    for _, c in ipairs(chars) do
+        if c.buf[1] then
+            if check_buff_needed(c, 33, now, 15) then buff_needed = true; break end
+            if REFRESH_JOBS[c.job] and check_buff_needed(c, 43, now, 15) then buff_needed = true; break end
+            if c.name ~= caster.name and check_buff_needed(c, 116, now, 15) then buff_needed = true; break end
+            if check_buff_needed(c, 40, now, 120) then buff_needed = true; break end
+            if check_buff_needed(c, 41, now, 120) then buff_needed = true; break end
+        end
+    end
+
+    if not buff_needed and caster.buf[1] then
+        if check_buff_needed(caster, 116, now, 15) then buff_needed = true end
+        if check_buff_needed(caster, 432, now, 300) then buff_needed = true end
+    end
+
+    if buff_needed then
+        if try_cast(string.format('/mst %s /ja "Composure" <me>', caster.name), caster, caster, 419, now, 2.0, 300) then return true end
+    end
+
     for _, c in ipairs(chars) do
         if c.buf[1] then
             if try_cast(string.format('/mst %s /ma "Haste II" %s', caster.name, c.name), caster, c, 33, now, CAST_LOCK, 15) then return true end
         end
     end
 
-    -- 3. Self Buffs
     if caster.buf[1] then
         if try_cast(string.format('/mst %s /ma "Phalanx" <me>', caster.name), caster, caster, 116, now, CAST_LOCK, 15) then return true end
         if try_cast(string.format('/mst %s /ma "Temper II" <me>', caster.name), caster, caster, 432, now, CAST_LOCK, 300) then return true end
     end
 
-    -- 4. Utility Buffs
     for _, c in ipairs(chars) do
         if c.buf[1] then
             if REFRESH_JOBS[c.job] and try_cast(string.format('/mst %s /ma "Refresh III" %s', caster.name, c.name), caster, c, 43, now, CAST_LOCK, 15) then return true end
             if c.name ~= caster.name and try_cast(string.format('/mst %s /ma "Phalanx II" %s', caster.name, c.name), caster, c, 116, now, CAST_LOCK, 15) then return true end
-            if not whm_present then
-                if try_cast(string.format('/mst %s /ma "Protect V" %s', caster.name, c.name), caster, c, 40, now, CAST_LOCK, 120) then return true end
-                if try_cast(string.format('/mst %s /ma "Shell V" %s', caster.name, c.name), caster, c, 41, now, CAST_LOCK, 120) then return true end
-            end
+            if try_cast(string.format('/mst %s /ma "Protect V" %s', caster.name, c.name), caster, c, 40, now, CAST_LOCK, 120) then return true end
+            if try_cast(string.format('/mst %s /ma "Shell V" %s', caster.name, c.name), caster, c, 41, now, CAST_LOCK, 120) then return true end
         end
     end
     return false
@@ -142,28 +164,34 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     if now - lastTick < TICK_INTERVAL then return end
     lastTick = now
 
-    local mm = AshitaCore:GetMemoryManager()
-    if not mm or mm:GetPlayer():GetIsZoning() ~= 0 then return end
+    if not memManager or memManager:GetPlayer():GetIsZoning() ~= 0 then 
+        zone_lock = now + 3.0
+        return 
+    end
     
-    local party, player, ent = mm:GetParty(), mm:GetPlayer(), mm:GetEntity()
+    if now < zone_lock then return end
+    
+    local party, player, ent = memManager:GetParty(), memManager:GetPlayer(), memManager:GetEntity()
     local caster = chars[RDM_INDEX]
-    local effectiveTarget = get_effective_target()
+    
+    -- Engagement Logic Fix
     local leaderTIdx = party:GetMemberTargetIndex(0)
     local leaderStatus = (leaderTIdx ~= 0) and ent:GetStatus(leaderTIdx) or 0
-    local mainEngaged = (leaderStatus == 1 or effectiveTarget ~= 0)
+    local leaderHP = (leaderTIdx ~= 0) and ent:GetHPPercent(leaderTIdx) or 0
+    
+    -- "MainEngaged" is now strictly defined as the leader being in combat (Status 1) and alive
+    local mainEngaged = (leaderStatus == 1 and leaderHP > 0)
+    local effectiveTarget = get_effective_target()
 
-    -- Buff Sync (0=Leader)
-    whm_present = false
+    -- Sync party data/buffs
     for p = 0, 5 do
         if party:GetMemberIsActive(p) == 1 then
             local rawName = party:GetMemberName(p)
             if rawName then
                 local pName = rawName:lower()
                 local pJob = party:GetMemberMainJob(p)
-                if pJob == 3 then whm_present = true end 
-
                 for _, c in ipairs(chars) do
-                    if pName == c.name:lower() then
+                    if pName == c.name_lower then
                         c.job = pJob
                         c.pIdx = p 
                         if p == 0 then 
@@ -192,6 +220,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             
             if c.e[1] then 
                 if mainEngaged then
+                    -- Only send attack command if the target index has actually changed
                     if c.engaged_target ~= effectiveTarget then
                         qcmd(string.format('/mst %s /attack [t]', c.name))
                         c.engaged_target = effectiveTarget
@@ -207,7 +236,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
-    -- Main RDM Loop
+    -- Main RDM Loop (Only runs if MainEngaged is true for debuffs)
     if now > caster.action_lock then
         if mainEngaged and caster.deb[1] and not caster.done and now > caster.deb_last + 2.5 then
             local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
@@ -217,7 +246,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 caster.deb_last = now; caster.action_lock = now + CAST_LOCK; caster.step = caster.step + 1 
             else caster.done = true end
         else
-            handle_surgical_buffs(caster, now)
+            handle_buffs(caster, now)
         end
     end
 
@@ -275,6 +304,5 @@ end)
 
 ashita.events.register('load','sync_load',function()
     qcmd('/ms followme on')
-    local now = os.clock()
-    chars[RDM_INDEX].last_cast[419] = now - 290 
+    qcmd('/mso /ms follow on')
 end)
