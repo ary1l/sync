@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '0.4.6' 
+addon.version = '0.5.0' 
 
 require('common')
 local imgui = require('imgui')
@@ -9,6 +9,9 @@ local imgui = require('imgui')
 -- CONFIGURATION & CACHE
 ------------------------------------------------------------
 local show_ui = true
+local CAST_LOCK = 3.8 
+local TICK_INTERVAL = 0.5
+
 local chars = {
     { name='shaymin',  is_guest=false, active=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='muunch',   is_guest=false, active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
@@ -18,10 +21,8 @@ local chars = {
 
 local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [15]=true, [16]=true, [21]=true }
 local RDM_INDEX = 4 
-local TICK_INTERVAL = 0.5
 local lastTick = os.clock() 
 local zone_lock = os.clock() + 3.0 
-local CAST_LOCK = 5.2 
 
 for _, c in ipairs(chars) do
     c.name_lower = c.name:lower()
@@ -192,57 +193,61 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local mainEngaged = (leaderStatus == 1)
     local effectiveTarget = get_effective_target()
 
+    -- Reset guest activity flags
     for _, c in ipairs(chars) do 
         if c.is_guest then c.active = false end 
     end
 
     for p = 0, 5 do
         if party:GetMemberIsActive(p) == 1 then
-            local rawName = party:GetMemberName(p)
-            if rawName then
-                local pName = rawName:lower()
-                local pJob = party:GetMemberMainJob(p)
-                local found = false
-                
-                for _, c in ipairs(chars) do
-                    if pName == c.name_lower then
-                        c.job = pJob
-                        c.pIdx = p 
-                        c.active = true
-                        if p == 0 then 
-                            local current_buffs = {}
-                            local pBuffs = player:GetBuffs()
-                            for j = 0, 31 do
-                                local b = pBuffs[j]
-                                if b and b > 0 and b ~= 255 then current_buffs[b] = true end
+            -- TRUST FILTER: Get the entity and check SpawnType (0 = PC, 2 = NPC/Trust)
+            local tIdx = party:GetMemberTargetIndex(p)
+            local mEnt = (tIdx ~= 0) and ent:GetRawEntity(tIdx) or nil
+            
+            -- If we can't find the entity (out of range), we assume it's okay for now.
+            -- If we DO find it and it's SpawnType 2, skip it.
+            if not (mEnt and mEnt.SpawnType == 2) then
+                local rawName = party:GetMemberName(p)
+                if rawName then
+                    local pName = rawName:lower()
+                    local pJob = party:GetMemberMainJob(p)
+                    local found = false
+                    
+                    for _, c in ipairs(chars) do
+                        if pName == c.name_lower then
+                            c.job = pJob; c.pIdx = p; c.active = true
+                            if p == 0 then 
+                                local current_buffs = {}
+                                local pBuffs = player:GetBuffs()
+                                for j = 0, 31 do
+                                    local b = pBuffs[j]
+                                    if b and b > 0 and b ~= 255 then current_buffs[b] = true end
+                                end
+                                c.buffs = current_buffs
                             end
-                            c.buffs = current_buffs
+                            found = true; break
                         end
-                        found = true
-                        break
                     end
-                end
-                
-                if not found then
-                    local new_guest = {
-                        name = rawName, name_lower = pName, is_guest = true, active = true,
-                        f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false},
-                        f_prev=false, e_prev=false,
-                        step=1, done=false, action_lock=0, hs_last=0, step_last=0, abs_last=0, deb_last=0,
-                        buffs={}, last_cast={}, job=pJob, pIdx=p, engaged_target=0
-                    }
-                    table.insert(chars, new_guest)
+                    
+                    if not found then
+                        local new_guest = {
+                            name = rawName, name_lower = pName, is_guest = true, active = true,
+                            f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false},
+                            f_prev=false, e_prev=false, step=1, done=false, action_lock=0, hs_last=0, step_last=0, abs_last=0, deb_last=0,
+                            buffs={}, last_cast={}, job=pJob, pIdx=p, engaged_target=0
+                        }
+                        table.insert(chars, new_guest)
+                    end
                 end
             end
         end
     end
 
     for i = #chars, 1, -1 do
-        if chars[i].is_guest and not chars[i].active then
-            table.remove(chars, i)
-        end
+        if chars[i].is_guest and not chars[i].active then table.remove(chars, i) end
     end
 
+    -- Follow and Attack Logic
     for i, c in ipairs(chars) do
         if not c.is_guest and i ~= 1 and c.pIdx ~= -1 then
             if c.f[1] ~= c.f_prev then
@@ -250,23 +255,29 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 c.f_prev = c.f[1]
             end
             
-            if c.e[1] then 
-                if mainEngaged then
-                    if c.engaged_target ~= effectiveTarget then
-                        qcmd(string.format('/mst %s /attack [t]', c.name))
-                        c.engaged_target = effectiveTarget
+            local should_be_attacking = c.e[1] and mainEngaged
+            
+            if should_be_attacking then
+                if c.engaged_target ~= effectiveTarget then
+                    qcmd(string.format('/mst %s /attack [t]', c.name))
+                    c.engaged_target = effectiveTarget
+                    -- Buffer magic for 2s to allow weapon draw animation
+                    if i == RDM_INDEX then
+                        c.action_lock = now + 2.0
+                        c.step = 1
+                        c.done = false
                     end
-                elseif c.engaged_target ~= 0 then
+                end
+            else
+                if c.engaged_target ~= 0 then
                     qcmd(string.format('/mst %s /attack off', c.name))
                     c.engaged_target = 0
                 end
-            elseif c.engaged_target ~= 0 then
-                qcmd(string.format('/mst %s /attack off', c.name))
-                c.engaged_target = 0
             end
         end
     end
 
+    -- RDM Main Loop
     if now > caster.action_lock then
         if mainEngaged and caster.deb[1] and not caster.done and now > caster.deb_last + 2.5 then
             local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
@@ -280,10 +291,10 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
+    -- Mule JA Logic
     for i, c in ipairs(chars) do
         if not c.is_guest and i ~= 1 and i ~= RDM_INDEX and now > c.action_lock and c.pIdx ~= -1 then
             local tp, mp = party:GetMemberTP(c.pIdx), party:GetMemberMP(c.pIdx)
-            
             if c.abs[1] and mp >= 33 and now > c.abs_last + 15 then
                 qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name))
                 c.abs_last = now; c.action_lock = now + 4.0
