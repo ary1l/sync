@@ -1,5 +1,222 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
+addon.version = '0.9.8.7' 
+
+require('common')
+local imgui = require('imgui')
+
+------------------------------------------------------------
+-- CONFIGURATION & SETTINGS
+------------------------------------------------------------
+local show_ui = true
+local CAST_LOCK = 4.0 
+local TICK_INTERVAL = 0.2 
+local lastTick = os.clock() 
+local zone_lock = os.clock() + 3.0 
+local SELF_TRUST_DURATION = 180.0 
+
+local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [8]=true, [15]=true, [16]=true, [21]=true, [22]=true }
+local SILENCE_LIST = {   ['Shadow']=true, ['Vampyr']=true, ['Warlock']=true  }
+
+local chars = {
+    { name='shaymin',  active=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='muunch',   active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='slowpoke', active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='goomy',    active=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+}
+
+local RDM_INDEX = 4 
+local global_buff_cache = {}
+local mm = AshitaCore:GetMemoryManager()
+local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
+
+local function init_char(c)
+    c.name_lower = c.name:lower()
+    c.f_prev, c.e_prev = c.f[1], c.e[1]
+    c.step, c.done, c.action_lock = 1, false, 0
+    c.last_target, c.silence_done = 0, false
+    c.last_cast = {} 
+    c.e[1], c.hs[1], c.bs[1], c.qs[1], c.abs[1], c.deb[1], c.buf[1] = false, false, false, false, false, false, false
+end
+
+for _, c in ipairs(chars) do init_char(c) end
+
+------------------------------------------------------------
+-- PACKET HANDLING & BUFF CHECK
+------------------------------------------------------------
+ashita.events.register('packet_in', 'HandlePackets', function (e)
+    if (e.id == 0x076) then
+        for k = 0, 4 do
+            local memberOffset = (4 + (k * 48))
+            local sId = ashita.bits.unpack_be(e.data_raw, memberOffset * 8, 32)
+            if sId > 0 then
+                local rawBuffs = {}
+                for i = 0, 31 do
+                    local bitPos = (memberOffset + 16) * 8 + (i * 10)
+                    local bid = ashita.bits.unpack_be(e.data_raw, bitPos, 10)
+                    if bid > 0 and bid < 1023 then rawBuffs[bid] = true end
+                end
+                global_buff_cache[sId] = rawBuffs
+            end
+        end
+    end
+end)
+
+local function has_buff(c, buff_id)
+    if c.pIdx == 0 then
+        local pBuffs = mm:GetPlayer():GetBuffs()
+        for j = 0, 31 do if pBuffs[j] == buff_id then return true end end
+    end
+    local buffs = global_buff_cache[c.sId]
+    return buffs and buffs[buff_id] == true
+end
+
+------------------------------------------------------------
+-- MAIN LOGIC
+------------------------------------------------------------
+local function handle_buffs(caster, now)
+    if not caster.buf[1] then return false end
+    if not has_buff(caster, 419) and (now - (caster.last_cast[419] or 0) > 10) then
+        qcmd(string.format('/mst %s /ja "Composure" <me>', caster.name))
+        caster.last_cast[419] = now; caster.action_lock = now + 2.0; return true
+    end
+    for _, c in ipairs(chars) do
+        if c.active and c.buf[1] then
+            local is_self = (c.name_lower == caster.name_lower)
+            local target_str = is_self and "<me>" or c.name
+            if not has_buff(c, 33) and (now - (c.last_cast[33] or 0) > SELF_TRUST_DURATION) then
+                qcmd(string.format('/mst %s /ma "Haste II" %s', caster.name, target_str))
+                c.last_cast[33] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+            if (is_self or REFRESH_JOBS[c.job]) and not has_buff(c, 43) and (now - (c.last_cast[43] or 0) > SELF_TRUST_DURATION) then
+                qcmd(string.format('/mst %s /ma "Refresh III" %s', caster.name, target_str))
+                c.last_cast[43] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+        end
+    end
+    return false
+end
+
+ashita.events.register('d3d_present', 'logic_loop', function ()
+    local now = os.clock()
+    if now - lastTick < TICK_INTERVAL then return end
+    lastTick = now
+
+    if not mm or mm:GetPlayer():GetIsZoning() ~= 0 then 
+        for _, c in ipairs(chars) do
+            c.e[1], c.hs[1], c.bs[1], c.qs[1], c.abs[1], c.deb[1], c.buf[1] = false, false, false, false, false, false, false
+        end
+        zone_lock = now + 3.0; return 
+    end    
+    if now < zone_lock then return end
+    
+    local party, ent = mm:GetParty(), mm:GetEntity()
+    local caster = chars[RDM_INDEX]
+    
+    local targ = mm:GetTarget()
+    local tIdx = targ and targ:GetTargetIndex(targ:GetIsSubTargetActive()) or 0
+    local effectiveTarget = (tIdx ~= 0) and (ent:GetTargetedIndex(tIdx) ~= 0 and ent:GetTargetedIndex(tIdx) or tIdx) or 0
+    local mainEngaged = (party:GetMemberTargetIndex(0) ~= 0 and ent:GetStatus(party:GetMemberTargetIndex(0)) == 1)
+
+    if effectiveTarget ~= 0 and effectiveTarget ~= caster.last_target then
+        caster.step, caster.done, caster.silence_done = 1, false, false
+        caster.last_target = effectiveTarget
+        caster.action_lock = 0 
+    end
+
+    for p = 0, 17 do
+        if party:GetMemberIsActive(p) == 1 then
+            local pName = party:GetMemberName(p):lower()
+            for _, c in ipairs(chars) do
+                if pName == c.name_lower then
+                    c.job, c.pIdx, c.sId, c.active = party:GetMemberMainJob(p), p, party:GetMemberServerId(p), true
+                end
+            end
+        end
+    end
+
+    if now > caster.action_lock and caster.active then
+        if mainEngaged and caster.deb[1] and not caster.done then
+            local tHP = ent:GetHPPercent(effectiveTarget)
+            local tName = ent:GetName(effectiveTarget)
+            if tHP > 0 and tHP < 100 then
+                if not caster.silence_done and SILENCE_LIST[tName] then
+                    qcmd(string.format('/mst %s /ma "Silence" [t]', caster.name))
+                    caster.silence_done = true; caster.action_lock = now + CAST_LOCK; return
+                end
+                local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
+                local s = debuffs[caster.step]
+                if s then 
+                    qcmd(string.format('/mst %s /ma "%s" [t]', caster.name, s))
+                    caster.step = caster.step + 1; caster.action_lock = now + CAST_LOCK
+                else caster.done = true end
+            end
+        else
+            handle_buffs(caster, now)
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- UI RENDERING (9-COLUMN GRID)
+------------------------------------------------------------
+ashita.events.register('d3d_present', 'render_ui', function ()
+    if not show_ui then return end
+    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {2, 2})
+    imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {2, 2})
+    
+    if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
+        if imgui.BeginTable('T', 9, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
+            imgui.TableSetupColumn('Name', 0, 50); imgui.TableSetupColumn('F', 0, 18); imgui.TableSetupColumn('E', 0, 18)
+            imgui.TableSetupColumn('HS', 0, 18); imgui.TableSetupColumn('BS', 0, 18); imgui.TableSetupColumn('QS', 0, 18)
+            imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
+            imgui.TableHeadersRow()
+            
+            for i, c in ipairs(chars) do
+                if c.active then
+                    imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:sub(1,6):upper())
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##BS'..i, c.bs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); if i == RDM_INDEX then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
+                    imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
+                end
+            end
+            imgui.EndTable()
+        end
+        imgui.End()
+    end
+    imgui.PopStyleVar(2)
+end)
+
+------------------------------------------------------------
+-- INITIALIZATION & COMMANDS
+------------------------------------------------------------
+local function force_sync()
+    local party = AshitaCore:GetMemoryManager():GetParty()
+    for i = 0, 17 do
+        if party:GetMemberIsActive(i) == 1 then
+            local sId = party:GetMemberServerId(i)
+            if sId > 0 then
+                local packet = struct.pack('bbbbI4', 0x016, 0x0a, 0, 0, sId)
+                AshitaCore:GetPacketManager():AddOutgoingPacket(0x016, packet:totable())
+            end
+        end
+    end
+end
+
+ashita.events.register('load', 'sync_load', function()
+    qcmd('/ms followme on'); qcmd('/mso /ms follow on')
+    force_sync()
+end)
+
+ashita.events.register('command', 'cmd_logic', function(e)
+    if e.command:args()[1]:lower() == '/sync' then show_ui = not show_ui; e.blocked = true end
+end)addon.name    = 'sync'
+addon.author  = 'aryl'
 addon.version = '0.9.2' 
 
 require('common')
