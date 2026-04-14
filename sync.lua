@@ -1,6 +1,7 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.032' 
+addon.version = '.0410'
+addon.desc    = 'Alliance-safe Engage/Follow sync with Buff/Debuff Logic'
 
 require('common')
 local imgui = require('imgui')
@@ -16,6 +17,7 @@ local refresh_jobs = {
     [15]=true, [16]=true, [21]=true, [22]=true 
 } 
 
+-- Combined character state table (UI booleans + internal tracking)
 local chars = {
     { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
@@ -27,9 +29,11 @@ local chars = {
 -- Internal State
 ------------------------------------------------------------
 local TICK_INTERVAL    = 0.4 
-local lastTick         = 0
-local CAST_LOCK_TIME   = 4.2 
+local ENGAGE_RETRY_GAP = 0.5
+local CAST_LOCK_TIME   = 3.8 
 local COMP_RETRY_DELAY = 300 
+local lastTick         = 0
+
 local debuff_list      = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
 
 local partyBuffsPtr = AshitaCore:GetPointerManager():Get('party.statusicons')
@@ -37,9 +41,11 @@ partyBuffsPtr = ashita.memory.read_uint32(partyBuffsPtr)
 
 for _, c in ipairs(chars) do
     c.f_prev, c.step, c.done, c.action_lock = c.f[1], 1, false, 0
-    c.e_prev = c.e[1] -- Watcher for Attack Off logic
+    c.e_prev = c.e[1] 
+    c.lastTarget = 0
+    c.lastEngageTime = 0
     c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
-    c.buffs = {h=false, r=false, p=false, comp=false, pro=false, sh=false}
+    c.buffs = {h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false}
     c.last_cast = {h=0, r=0, p=0, comp=0, pro=0, sh=0}
 end
 
@@ -54,19 +60,21 @@ local function is_in_list(val, list)
     return false
 end
 
+-- Reads memory to get exact party buffs (includes Haste Samba check now)
 local function scan_party_buffs()
     local partyMgr = mm:GetParty()
     if partyBuffsPtr == 0 then return end
 
     for _, c in ipairs(chars) do
-        local h, r, p, comp, pro, sh = false, false, false, false, false, false
+        local h, r, p, comp, pro, sh, hsamba = false, false, false, false, false, false, false
         if c.name:lower() == (partyMgr:GetMemberName(0) or ''):lower() then
             local icons = mm:GetPlayer():GetStatusIcons()
             for i = 1, 32 do
                 local b = icons[i]
                 if b <= 0 or b == 255 then break end
                 if b == 33 then h = true elseif b == 43 then r = true elseif b == 116 then p = true 
-                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true end
+                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true
+                elseif b == 370 then hsamba = true end -- 370 is Haste Samba
             end
         else
             local sId = -1
@@ -83,7 +91,8 @@ local function scan_party_buffs()
                                 high = bit.lshift(bit.band(bit.rshift(high, (j % 4) * 2), 0x03), 8)
                                 local b = high + low
                                 if b == 33 then h = true elseif b == 43 then r = true elseif b == 116 then p = true 
-                                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true end
+                                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true
+                                elseif b == 370 then hsamba = true end
                             end
                             break
                         end
@@ -92,7 +101,7 @@ local function scan_party_buffs()
                 end
             end
         end
-        c.buffs.h, c.buffs.r, c.buffs.p, c.buffs.comp, c.buffs.pro, c.buffs.sh = h, r, p, comp, pro, sh
+        c.buffs.h, c.buffs.r, c.buffs.p, c.buffs.comp, c.buffs.pro, c.buffs.sh, c.buffs.hsamba = h, r, p, comp, pro, sh, hsamba
     end
 end
 
@@ -109,19 +118,30 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 
     local party = mm:GetParty()
     local ent = mm:GetEntity()
+    local targ = mm:GetTarget()
+    
     local leaderTIdx = party:GetMemberTargetIndex(0)
     local mainEngaged = (leaderTIdx ~= 0 and ent:GetStatus(leaderTIdx) == 1)
+    
+    -- Get Main's Target and HP% (From v0.4 logic)
+    local playerTarget = 0
+    local targetHPP = 100
+    if leaderTIdx ~= 0 then
+        local isSub = targ:GetIsSubTargetActive()
+        playerTarget = targ:GetTargetIndex(isSub)
+        if playerTarget > 0 then
+            targetHPP = ent:GetHPPercent(playerTarget)
+        end
+    end
     
     -- STATE WATCHER (Attack Off / Follow Toggle)
     for _, c in ipairs(chars) do
         if c.name:lower() ~= 'shaymin' then
-            -- Engage Watcher
             if c.e_prev == true and c.e[1] == false then
                 qcmd(string.format('/mst %s /attack off', c.name))
             end
             c.e_prev = c.e[1]
             
-            -- Follow Watcher
             if c.f_prev == false and c.f[1] == true then
                 qcmd(string.format('/mst %s /ms follow on', c.name))
             elseif c.f_prev == true and c.f[1] == false then
@@ -173,33 +193,62 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
-    -- COMBAT JAs & DEBUFFS
+-- COMBAT JAs & DEBUFFS
     if mainEngaged then
         local targetName = ent:GetName(leaderTIdx) or ""
         for i, c in ipairs(chars) do
             if c.name:lower() ~= 'shaymin' and now > c.action_lock then
-                if c.e[1] then qcmd(string.format('/mst %s /attack on', c.name)) end
+                
+                -- Engage Logic (from v0.4 target switching mechanism)
+                if c.e[1] then 
+                    local timeSince = now - c.lastEngageTime
+                    if c.lastTarget ~= playerTarget and timeSince >= ENGAGE_RETRY_GAP then
+                        qcmd(string.format('/mst %s /attack on', c.name))
+                        c.lastEngageTime = now
+                        c.action_lock = now + 1.0 
+                        -- Note: we update c.lastTarget below to keep the logic clean
+                    end
+                end
+
+                -- TARGET SWAP RESET (Place this right here)
+                if c.lastTarget ~= playerTarget then
+                    c.step = 1
+                    c.done = false
+                    c.lastTarget = playerTarget -- Update saved ID to the new target
+                end
                 
                 local pIdx = -1
                 for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
                 
                 if pIdx ~= -1 then
-                    local tp = party:GetMemberTP(pIdx)
+                    
+                    -- Goomy Debuff Logic
                     if c.name:lower() == 'goomy' and c.deb[1] and not c.done then
-                        local s = debuff_list[c.step]
-                        if s then
-                            qcmd(string.format('/mst goomy /ma "%s" <t>', s))
-                            c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
-                        elseif is_in_list(targetName, silence_whitelist) and c.step == (#debuff_list + 1) then
-                            qcmd('/mst goomy /ma "Silence" <t>')
-                            c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
-                        else c.done = true end
+                        if targetHPP < 50 then
+                            -- Target is below 50% HP, abort the debuff cycle to save MP/Time
+                            c.done = true
+                        else
+                            local s = debuff_list[c.step]
+                            if s then
+                                qcmd(string.format('/mst goomy /ma "%s" [t]', s))
+                                c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
+                            elseif is_in_list(targetName, silence_whitelist) and c.step == (#debuff_list + 1) then
+                                qcmd('/mst goomy /ma "Silence" <t>')
+                                c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
+                            else 
+                                c.done = true 
+                            end
+                        end
                     end
 
+                    -- JAs
                     if c.abs[1] and now > c.abs_last + 45 then
-                        qcmd(string.format('/mst %s /ma "Absorb-TP" <t>', c.name)); c.abs_last = now; c.action_lock = now + 2.0
-                    elseif c.hs[1] and tp >= 350 and now > c.hs_last + 90 then
+                        qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name)); c.abs_last = now; c.action_lock = now + 2.0
+                        
+                    -- Haste Samba (Requires missing buff AND TP > 350)
+                    elseif c.hs[1] and tp >= 350 and not c.buffs.hsamba and now > c.hs_last + 5 then
                         qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name)); c.hs_last = now; c.action_lock = now + 2.0
+                        
                     elseif (c.bs[1] or c.qs[1]) and tp >= 100 and now > c.step_last + 12 then
                         local ja = c.bs[1] and "Box Step" or "Quick Step"
                         qcmd(string.format('/mst %s /ja "%s" <t>', c.name, ja)); c.step_last = now; c.action_lock = now + 2.0
@@ -208,7 +257,12 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             end
         end
     else
-        for _, c in ipairs(chars) do c.step = 1; c.done = false end
+        -- Reset cycle when disengaged
+        for _, c in ipairs(chars) do 
+            c.step = 1 
+            c.done = false 
+            c.lastTarget = 0
+        end
     end
 end)
 
