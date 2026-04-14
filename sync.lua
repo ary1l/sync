@@ -1,5 +1,259 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
+addon.version = '.042' 
+
+require('common')
+local imgui = require('imgui')
+
+------------------------------------------------------------
+-- CONFIGURATION & SETTINGS
+------------------------------------------------------------
+local show_ui = true
+local CAST_LOCK = 4.2 
+local TICK_INTERVAL = 0.5
+local lastTick = os.clock() 
+local zone_lock = os.clock() + 3.0 
+local SELF_TRUST_DURATION = 180.0 
+
+local REFRESH_JOBS = { [3]=true, [4]=true, [5]=true, [7]=true, [8]=true, [15]=true, [16]=true, [21]=true, [22]=true }
+local SILENCE_LIST = { 
+    ['Crimson-toothed Pawberry']=true, ['Korrigan']=true, ['Sozu Rognot']=true, 
+    ['Ghost']=true, ['Shadow']=true, ['Vampyr']=true, ['Warlock']=true 
+}
+
+local chars = {
+    { name='shaymin',  active=false, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='muunch',   active=false, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='slowpoke', active=false, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='goomy',    active=false, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+}
+
+local RDM_INDEX = 4 
+local global_buff_cache = {} 
+local mm = AshitaCore:GetMemoryManager()
+local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
+
+for _, c in ipairs(chars) do
+    c.name_lower = c.name:lower()
+    c.f_prev = c.f[1]
+    c.e_prev = c.e[1]
+    c.step, c.done, c.action_lock = 1, false, 0
+    c.buffs = {} 
+    c.last_cast = {} 
+    c.silence_done = false
+end
+
+------------------------------------------------------------
+-- SERVER DATA REQUESTS
+------------------------------------------------------------
+local function force_sync()
+    local party = mm:GetParty()
+    print('[Sync] Requesting fresh buff data from server...')
+    for i = 0, 17 do
+        if party:GetMemberIsActive(i) == 1 then
+            local sId = party:GetMemberServerId(i)
+            if sId > 0 then
+                local p = struct.pack('bbbbI', 0x16, 0x06, 0, 0, sId):totable()
+                AshitaCore:GetPacketManager():AddOutgoingPacket(0x16, p)
+            end
+        end
+    end
+end
+
+ashita.events.register('load', 'sync_load', function()
+    qcmd('/ms followme on'); qcmd('/mso /ms follow on')
+    force_sync()
+end)
+
+------------------------------------------------------------
+-- PACKET LOGIC
+------------------------------------------------------------
+ashita.events.register('packet_in', 'HandlePackets', function (e)
+    if (e.id == 0x00A) then
+        for _, c in ipairs(chars) do 
+            c.e[1] = false; c.e_prev = false
+            c.hs[1] = false; c.bs[1] = false; c.qs[1] = false
+            c.abs[1] = false; c.deb[1] = false; c.buf[1] = false
+            c.last_cast = {}; c.done, c.step = false, 1; c.silence_done = false
+        end
+        zone_lock = os.clock() + 4.0
+        return
+    end
+
+    if (e.id == 0x076) then
+        local party = mm:GetParty()
+        for i = 0, 17 do 
+            if party:GetMemberIsActive(i) == 1 then
+                local name = party:GetMemberName(i)
+                if name then
+                    local name_l = name:lower()
+                    local current_buffs = {}
+                    for j = 0, 31 do
+                        local bid = ashita.bits.unpack_be(e.data_raw, i * 40, 16 + (j * 8), 8)
+                        if bid > 0 and bid < 255 then current_buffs[bid] = true end
+                    end
+                    global_buff_cache[name_l] = current_buffs
+                end
+            end
+        end
+    end
+end)
+
+local function has_buff(target_char, buff_id)
+    if target_char.name_lower == 'shaymin' then
+        local pBuffs = mm:GetPlayer():GetBuffs()
+        for j = 0, 31 do if pBuffs[j] == buff_id then return true end end
+    end
+    if os.clock() - (target_char.last_cast[buff_id] or 0) < SELF_TRUST_DURATION then return true end
+    local cache = global_buff_cache[target_char.name_lower]
+    return cache and cache[buff_id] == true
+end
+
+------------------------------------------------------------
+-- BRAIN LOGIC
+------------------------------------------------------------
+local function handle_buffs(caster, now)
+    local any_buffing = false
+    for _, c in ipairs(chars) do if c.active and c.buf[1] then any_buffing = true; break end end
+    if not any_buffing then return false end
+
+    if not has_buff(caster, 419) then 
+        if now - (caster.last_cast[419] or 0) > 305 then 
+            qcmd(string.format('/mst %s /ja "Composure" <me>', caster.name))
+            caster.last_cast[419] = now; caster.action_lock = now + 2.0; return true
+        end
+    end
+
+    for _, c in ipairs(chars) do
+        if c.active and c.buf[1] then
+            local is_self = (c.name_lower == caster.name_lower)
+            local target_str = is_self and "<me>" or c.name
+
+            if not has_buff(c, 116) then
+                local spell = is_self and "Phalanx" or "Phalanx II"
+                qcmd(string.format('/mst %s /ma "%s" %s', caster.name, spell, target_str))
+                c.last_cast[116] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+            if (is_self or REFRESH_JOBS[c.job]) and not has_buff(c, 591) then
+                qcmd(string.format('/mst %s /ma "Refresh III" %s', caster.name, target_str))
+                c.last_cast[591] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+            if not has_buff(c, 580) then
+                qcmd(string.format('/mst %s /ma "Haste II" %s', caster.name, target_str))
+                c.last_cast[580] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+            if not has_buff(c, 40) and (now - (c.last_cast[40] or 0) > 600) then
+                qcmd(string.format('/mst %s /ma "Protect V" %s', caster.name, target_str))
+                c.last_cast[40] = now; caster.action_lock = now + CAST_LOCK; return true
+            elseif not has_buff(c, 41) and (now - (c.last_cast[41] or 0) > 600) then
+                qcmd(string.format('/mst %s /ma "Shell V" %s', caster.name, target_str))
+                c.last_cast[41] = now; caster.action_lock = now + CAST_LOCK; return true
+            end
+        end
+    end
+    return false
+end
+
+------------------------------------------------------------
+-- CORE LOOP
+------------------------------------------------------------
+ashita.events.register('d3d_present', 'logic_loop', function ()
+    local now = os.clock()
+    if not mm or mm:GetPlayer():GetIsZoning() ~= 0 or now < zone_lock then return end
+    
+    local party, ent = mm:GetParty(), mm:GetEntity()
+    local goomy = chars[RDM_INDEX]
+    local leaderTIdx = party:GetMemberTargetIndex(0)
+    local mainEngaged = (ent:GetStatus(leaderTIdx) == 1)
+
+    for _, c in ipairs(chars) do c.active = false end
+    for p = 0, 17 do
+        if party:GetMemberIsActive(p) == 1 then
+            local pName = party:GetMemberName(p):lower()
+            for _, c in ipairs(chars) do
+                if pName == c.name_lower then 
+                    c.job, c.active = party:GetMemberMainJob(p), true
+                    break 
+                end
+            end
+        end
+    end
+
+    if goomy and goomy.active and now > (goomy.action_lock or 0) then
+        if mainEngaged and goomy.deb[1] then
+            if not goomy.done then
+                local tName = ent:GetName(leaderTIdx)
+                if not goomy.silence_done and SILENCE_LIST[tName] then
+                    qcmd(string.format('/mst %s /ma "Silence" <t>', goomy.name))
+                    goomy.silence_done = true; goomy.action_lock = now + CAST_LOCK; return
+                end
+                local debuffs = { "Dia III", "Frazzle III", "Distract III", "Blind II", "Slow II", "Paralyze II" }
+                local s = debuffs[goomy.step or 1]
+                if s then 
+                    qcmd(string.format('/mst %s /ma "%s" <t>', goomy.name, s))
+                    goomy.step = (goomy.step or 1) + 1; goomy.action_lock = now + CAST_LOCK; return 
+                else goomy.done = true end
+            end
+        end
+        handle_buffs(goomy, now)
+    end
+
+    for i, c in ipairs(chars) do
+        if c.active and i ~= 1 then
+            if c.f[1] ~= c.f_prev then qcmd(string.format('/mst %s /ms follow %s', c.name, c.f[1] and 'on' or 'off')); c.f_prev = c.f[1] end
+            if c.e[1] ~= c.e_prev then
+                if not c.e[1] then qcmd(string.format('/mst %s /attack off', c.name)) end
+                c.e_prev = c.e[1]
+            end
+            if c.e[1] and mainEngaged then
+                local mIdx = party:GetMemberTargetIndex(i-1)
+                if mIdx ~= 0 and ent:GetStatus(mIdx) ~= 1 then qcmd(string.format('/mst %s /attack on', c.name)) end
+            end
+        end
+    end
+    if not mainEngaged then goomy.step, goomy.done, goomy.silence_done = 1, false, false end
+end)
+
+------------------------------------------------------------
+-- GUI
+------------------------------------------------------------
+ashita.events.register('d3d_present', 'render_ui', function ()
+    if not show_ui then return end
+    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {2, 2}); imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {2, 2})
+    if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
+        if imgui.BeginTable('T', 9, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
+            imgui.TableSetupColumn('Name', 0, 50); imgui.TableSetupColumn('F', 0, 18); imgui.TableSetupColumn('E', 0, 18)
+            imgui.TableSetupColumn('HS', 0, 18); imgui.TableSetupColumn('BS', 0, 18); imgui.TableSetupColumn('QS', 0, 18)
+            imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
+            imgui.TableHeadersRow()
+            for i, c in ipairs(chars) do
+                if c.active then
+                    imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:sub(1,5):upper())
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##B'..i, c.bs) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.Text("-") end
+                    imgui.TableNextColumn(); if i == RDM_INDEX then imgui.Checkbox('##D'..i, c.deb) else imgui.Text("-") end
+                    imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
+                end
+            end
+            imgui.EndTable()
+        end
+        imgui.End()
+    end
+    imgui.PopStyleVar(2)
+end)
+
+ashita.events.register('command', 'cmd_logic', function(e)
+    local args = e.command:args()
+    if args[1]:lower() == '/sync' then
+        if args[2] and args[2]:lower() == 'force' then force_sync() else show_ui = not show_ui end
+        e.blocked = true
+    end
+end)addon.name    = 'sync'
+addon.author  = 'aryl'
 addon.version = '.01123' 
 
 require('common')
