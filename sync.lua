@@ -47,6 +47,7 @@ for _, c in ipairs(chars) do
     c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
     c.buffs = {h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false}
     c.last_cast = {h=0, r=0, p=0, comp=0, pro=0, sh=0}
+	c.silenced = false
 end
 
 local mm = AshitaCore:GetMemoryManager()
@@ -123,7 +124,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local leaderTIdx = party:GetMemberTargetIndex(0)
     local mainEngaged = (leaderTIdx ~= 0 and ent:GetStatus(leaderTIdx) == 1)
     
-    -- Get Main's Target and HP% (From v0.4 logic)
     local playerTarget = 0
     local targetHPP = 100
     if leaderTIdx ~= 0 then
@@ -193,47 +193,51 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
--- COMBAT JAs & DEBUFFS
+    -- COMBAT JAs & DEBUFFS
     if mainEngaged then
         local targetName = ent:GetName(leaderTIdx) or ""
         for i, c in ipairs(chars) do
             if c.name:lower() ~= 'shaymin' and now > c.action_lock then
                 
-                -- Engage Logic (from v0.4 target switching mechanism)
+                -- 1. Engage Logic
                 if c.e[1] then 
                     local timeSince = now - c.lastEngageTime
                     if c.lastTarget ~= playerTarget and timeSince >= ENGAGE_RETRY_GAP then
                         qcmd(string.format('/mst %s /attack on', c.name))
                         c.lastEngageTime = now
                         c.action_lock = now + 1.0 
-                        -- Note: we update c.lastTarget below to keep the logic clean
                     end
                 end
 
-                -- TARGET SWAP RESET (Place this right here)
+                -- 2. TARGET SWAP RESET 
                 if c.lastTarget ~= playerTarget then
                     c.step = 1
                     c.done = false
-                    c.lastTarget = playerTarget -- Update saved ID to the new target
+                    c.silenced = false 
+                    c.lastTarget = playerTarget 
                 end
                 
                 local pIdx = -1
                 for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
                 
                 if pIdx ~= -1 then
+                    local tp = party:GetMemberTP(pIdx)
                     
-                    -- Goomy Debuff Logic
+                    -- 3. Goomy Debuff Logic
                     if c.name:lower() == 'goomy' and c.deb[1] and not c.done then
                         if targetHPP < 50 then
-                            -- Target is below 50% HP, abort the debuff cycle to save MP/Time
                             c.done = true
                         else
+                            -- SILENCE INTERRUPT: Triggers after Frazzle III (Step 2)
+                            if not c.silenced and is_in_list(targetName, silence_whitelist) and c.step > 2 then
+                                qcmd('/mst goomy /ma "Silence" <t>')
+                                c.silenced = true
+                                c.action_lock = now + CAST_LOCK_TIME; return
+                            end
+
                             local s = debuff_list[c.step]
                             if s then
                                 qcmd(string.format('/mst goomy /ma "%s" [t]', s))
-                                c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
-                            elseif is_in_list(targetName, silence_whitelist) and c.step == (#debuff_list + 1) then
-                                qcmd('/mst goomy /ma "Silence" <t>')
                                 c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
                             else 
                                 c.done = true 
@@ -241,14 +245,11 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                         end
                     end
 
-                    -- JAs
+                    -- 4. JAs
                     if c.abs[1] and now > c.abs_last + 45 then
                         qcmd(string.format('/mst %s /ma "Absorb-TP" [t]', c.name)); c.abs_last = now; c.action_lock = now + 2.0
-                        
-                    -- Haste Samba (Requires missing buff AND TP > 350)
                     elseif c.hs[1] and tp >= 350 and not c.buffs.hsamba and now > c.hs_last + 5 then
                         qcmd(string.format('/mst %s /ja "Haste Samba" <me>', c.name)); c.hs_last = now; c.action_lock = now + 2.0
-                        
                     elseif (c.bs[1] or c.qs[1]) and tp >= 100 and now > c.step_last + 12 then
                         local ja = c.bs[1] and "Box Step" or "Quick Step"
                         qcmd(string.format('/mst %s /ja "%s" <t>', c.name, ja)); c.step_last = now; c.action_lock = now + 2.0
@@ -259,13 +260,10 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     else
         -- Reset cycle when disengaged
         for _, c in ipairs(chars) do 
-            c.step = 1 
-            c.done = false 
-            c.lastTarget = 0
+            c.step = 1; c.done = false; c.silenced = false; c.lastTarget = 0
         end
     end
 end)
-
 ------------------------------------------------------------
 -- UI & COMMANDS
 ------------------------------------------------------------
