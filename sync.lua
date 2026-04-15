@@ -7,17 +7,43 @@ require('common')
 local imgui = require('imgui')
 
 ------------------------------------------------------------
--- CONFIGURATION
+-- CONFIGURATION & DICTIONARIES
 ------------------------------------------------------------
 local show_ui = true
+
+local ROLES = {
+    main = '',
+    rdm  = ''
+}
+
+local BUFF_IDS = {
+    HASTE       = 33,
+    PROTECT     = 40,
+    SHELL       = 41,
+    REFRESH     = 43,
+    PHALANX     = 116,
+    HASTE_SAMBA = 370,
+    COMPOSURE   = 419
+}
+
+local JOB_IDS = {
+    WHM = 3, BLM = 4, RDM = 5, PLD = 7, DRK = 8, 
+    SMN = 15, BLU = 16, GEO = 21, RUN = 22
+}
+
 local silence_whitelist = { "Ahriman", "Crawler", "Fly", "Ghost", "Hecteyes", "Imp", "Shadow", "Skeleton" }
-local refresh_jobs = { [3]=true, [4]=true, [5]=true, [7]=true, [8]=true, [15]=true, [16]=true, [21]=true, [22]=true } 
+
+local refresh_jobs = { 
+    [JOB_IDS.WHM] = true, [JOB_IDS.BLM] = true, [JOB_IDS.RDM] = true, 
+    [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, [JOB_IDS.SMN] = true, 
+    [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, [JOB_IDS.RUN] = true 
+} 
 
 local chars = {
-    { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='slowpoke', f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='goomy',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='', f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
 local guests = {}
@@ -115,20 +141,31 @@ local function update_membership_and_zones(party)
     end
 end
 
+-- Helper to clean up buff parsing logic
+local function parse_buff(b, buffs)
+    if b == BUFF_IDS.HASTE then buffs.h = true
+    elseif b == BUFF_IDS.REFRESH then buffs.r = true
+    elseif b == BUFF_IDS.PHALANX then buffs.p = true
+    elseif b == BUFF_IDS.COMPOSURE then buffs.comp = true
+    elseif b == BUFF_IDS.PROTECT then buffs.pro = true
+    elseif b == BUFF_IDS.SHELL then buffs.sh = true
+    elseif b == BUFF_IDS.HASTE_SAMBA then buffs.hsamba = true
+    end
+end
+
 local function scan_buffs(t, partyMgr)
     if not partyMgr or partyBuffsPtr == 0 then return end
     
     for _, c in ipairs(t) do
-        local h, r, p, comp, pro, sh, hsamba = false, false, false, false, false, false, false
+        -- Reset buffs before scanning
+        local buffs = {h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false}
         
         if c.name:lower() == (partyMgr:GetMemberName(0) or ''):lower() then
             local icons = mm:GetPlayer():GetStatusIcons()
             for i = 1, 32 do
                 local b = icons[i]
                 if b <= 0 or b == 255 then break end
-                if b == 33 then h = true elseif b == 43 then r = true elseif b == 116 then p = true 
-                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true
-                elseif b == 370 then hsamba = true end
+                parse_buff(b, buffs)
             end
         else
             for i = 1, 5 do
@@ -143,9 +180,7 @@ local function scan_buffs(t, partyMgr)
                                 local high = ashita.memory.read_uint8(mPtr + 8 + math.floor(j / 4))
                                 high = bit.lshift(bit.band(bit.rshift(high, (j % 4) * 2), 0x03), 8)
                                 local b = high + low
-                                if b == 33 then h = true elseif b == 43 then r = true elseif b == 116 then p = true 
-                                elseif b == 419 then comp = true elseif b == 40 then pro = true elseif b == 41 then sh = true
-                                elseif b == 370 then hsamba = true end
+                                parse_buff(b, buffs)
                             end
                             break
                         end
@@ -154,7 +189,7 @@ local function scan_buffs(t, partyMgr)
                 end
             end
         end
-        c.buffs.h, c.buffs.r, c.buffs.p, c.buffs.comp, c.buffs.pro, c.buffs.sh, c.buffs.hsamba = h, r, p, comp, pro, sh, hsamba
+        c.buffs = buffs
     end
 end
 
@@ -182,11 +217,10 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local party = mm:GetParty()
     update_membership_and_zones(party)
     
-    -- We allow scanning and follow commands even if is_zoning is true,
-    -- but combat/rdm logic is skipped.
+    -- Follow commands bypass zoning checks
     if is_zoning then 
         for _, c in ipairs(chars) do
-            if c.name:lower() ~= 'shaymin' then
+            if c.name:lower() ~= ROLES.main:lower() then
                 if c.f_prev == false and c.f[1] == true then qcmd(string.format('/mst %s /ms follow on', c.name), true)
                 elseif c.f_prev == true and c.f[1] == false then qcmd(string.format('/mst %s /ms follow off', c.name), true) end
                 c.f_prev = c.f[1]
@@ -219,7 +253,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     ------------------------------------------------------------
     local rdm = nil
     for _, c in ipairs(chars) do
-        if c.name:lower() == 'goomy' then rdm = c break end
+        if c.name:lower() == ROLES.rdm:lower() then rdm = c break end
     end
 
     if rdm and rdm.in_zone and now > rdm.action_lock then
@@ -242,16 +276,16 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 
         if buffTarget then
             if not rdm.buffs.comp and (now - rdm.last_cast.comp > COMP_RETRY_DELAY) then
-                qcmd('/mst goomy /ja "Composure" <me>'); rdm.last_cast.comp = now; rdm.action_lock = now + 1.5
+                qcmd(string.format('/mst %s /ja "Composure" <me>', ROLES.rdm)); rdm.last_cast.comp = now; rdm.action_lock = now + 1.5
             else
-                if refresh_jobs[targetJob] and not buffTarget.buffs.r then qcmd(string.format('/mst goomy /ma "Refresh III" %s', buffTarget.name))
-                elseif not buffTarget.buffs.h then qcmd(string.format('/mst goomy /ma "Haste II" %s', buffTarget.name))
+                if refresh_jobs[targetJob] and not buffTarget.buffs.r then qcmd(string.format('/mst %s /ma "Refresh III" %s', ROLES.rdm, buffTarget.name))
+                elseif not buffTarget.buffs.h then qcmd(string.format('/mst %s /ma "Haste II" %s', ROLES.rdm, buffTarget.name))
                 elseif not buffTarget.buffs.p then
-                    local s = (buffTarget.name:lower() == 'goomy') and 'Phalanx' or 'Phalanx II'
-                    local tg = (buffTarget.name:lower() == 'goomy') and '<me>' or buffTarget.name
-                    qcmd(string.format('/mst goomy /ma "%s" %s', s, tg))
-                elseif not buffTarget.buffs.pro then qcmd(string.format('/mst goomy /ma "Protect V" %s', buffTarget.name))
-                elseif not buffTarget.buffs.sh then qcmd(string.format('/mst goomy /ma "Shell V" %s', buffTarget.name))
+                    local s = (buffTarget.name:lower() == ROLES.rdm:lower()) and 'Phalanx' or 'Phalanx II'
+                    local tg = (buffTarget.name:lower() == ROLES.rdm:lower()) and '<me>' or buffTarget.name
+                    qcmd(string.format('/mst %s /ma "%s" %s', ROLES.rdm, s, tg))
+                elseif not buffTarget.buffs.pro then qcmd(string.format('/mst %s /ma "Protect V" %s', ROLES.rdm, buffTarget.name))
+                elseif not buffTarget.buffs.sh then qcmd(string.format('/mst %s /ma "Shell V" %s', ROLES.rdm, buffTarget.name))
                 end
                 rdm.action_lock = now + CAST_LOCK_TIME
             end
@@ -260,10 +294,10 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             else
                 local targetName = ent:GetName(engageTarget) or ""
                 if not rdm.silenced and is_in_list(targetName, silence_whitelist) and rdm.step > 2 then
-                    qcmd('/mst goomy /ma "Silence" [t]'); rdm.silenced = true; rdm.action_lock = now + CAST_LOCK_TIME
+                    qcmd(string.format('/mst %s /ma "Silence" [t]', ROLES.rdm)); rdm.silenced = true; rdm.action_lock = now + CAST_LOCK_TIME
                 else
                     local s = debuff_list[rdm.step]
-                    if s then qcmd(string.format('/mst goomy /ma "%s" [t]', s)); rdm.step = rdm.step + 1; rdm.action_lock = now + CAST_LOCK_TIME
+                    if s then qcmd(string.format('/mst %s /ma "%s" [t]', ROLES.rdm, s)); rdm.step = rdm.step + 1; rdm.action_lock = now + CAST_LOCK_TIME
                     else rdm.done = true end
                 end
             end
@@ -274,13 +308,11 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     -- CHARACTER ACTIONS (FOLLOW / ATTACK / JA)
     ------------------------------------------------------------
     for _, c in ipairs(chars) do
-        if c.name:lower() ~= 'shaymin' then
-            -- Follow commands bypass zoning checks
+        if c.name:lower() ~= ROLES.main:lower() then
             if c.f_prev == false and c.f[1] == true then qcmd(string.format('/mst %s /ms follow on', c.name), true)
             elseif c.f_prev == true and c.f[1] == false then qcmd(string.format('/mst %s /ms follow off', c.name), true) end
             c.f_prev = c.f[1]
 
-            -- Combat logic requires character to be in-zone
             if c.in_zone then
                 local pIdx = -1
                 for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
@@ -318,30 +350,60 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 end)
 
 ------------------------------------------------------------
--- UI & EVENTS
+-- UI CONFIGURATION & EVENTS
 ------------------------------------------------------------
+local ui_columns = {
+    { label = 'F',  key = 'f',   allow_main = false, rdm_only = false },
+    { label = 'E',  key = 'e',   allow_main = false, rdm_only = false },
+    { label = 'HS', key = 'hs',  allow_main = false, rdm_only = false },
+    { label = 'BS', key = 'bs',  allow_main = false, rdm_only = false },
+    { label = 'QS', key = 'qs',  allow_main = false, rdm_only = false },
+    { label = 'Ab', key = 'abs', allow_main = false, rdm_only = false },
+    { label = 'De', key = 'deb', allow_main = false, rdm_only = true },
+    { label = 'Bu', key = 'buf', allow_main = true,  rdm_only = false }
+}
+
 ashita.events.register('d3d_present', 'render_ui', function ()
     if not show_ui then return end
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, {2, 2}); imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {2, 2})
+    
     if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
-        if imgui.BeginTable('T', 9, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
-            imgui.TableSetupColumn('Name', 0, 50); imgui.TableSetupColumn('F', 0, 18); imgui.TableSetupColumn('E', 0, 18)
-            imgui.TableSetupColumn('HS', 0, 18); imgui.TableSetupColumn('BS', 0, 18); imgui.TableSetupColumn('QS', 0, 18)
-            imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
+        if imgui.BeginTable('T', #ui_columns + 1, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
+            
+            -- Dynamic Headers
+            imgui.TableSetupColumn('Name', 0, 50)
+            for _, col in ipairs(ui_columns) do
+                imgui.TableSetupColumn(col.label, 0, 18)
+            end
             imgui.TableHeadersRow()
             
+            -- Dynamic Rows
             for i, c in ipairs(chars) do
-                imgui.TableNextRow(); imgui.TableNextColumn()
-                if not c.in_zone then imgui.TextColored({1.0, 0.2, 0.2, 1.0}, c.name:sub(1,5):upper())
-                else imgui.Text(c.name:sub(1,5):upper()) end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##E'..i, c.e) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##H'..i, c.hs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##BS'..i, c.bs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##Q'..i, c.qs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##A'..i, c.abs) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); if c.name == 'goomy' then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
-                imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
+                imgui.TableNextRow()
+                imgui.TableNextColumn()
+                
+                local is_main = (c.name:lower() == ROLES.main:lower())
+                local is_rdm  = (c.name:lower() == ROLES.rdm:lower())
+                
+                if not c.in_zone then 
+                    imgui.TextColored({1.0, 0.2, 0.2, 1.0}, c.name:sub(1,5):upper())
+                else 
+                    imgui.Text(c.name:sub(1,5):upper()) 
+                end
+                
+                for _, col in ipairs(ui_columns) do
+                    imgui.TableNextColumn()
+                    local can_show = true
+                    
+                    if is_main and not col.allow_main then can_show = false end
+                    if col.rdm_only and not is_rdm then can_show = false end
+                    
+                    if can_show then
+                        imgui.Checkbox('##'..col.label..i, c[col.key])
+                    else
+                        imgui.TextDisabled("-")
+                    end
+                end
             end
             imgui.EndTable()
         end
