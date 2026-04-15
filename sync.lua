@@ -1,7 +1,7 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.0412'
-addon.desc    = 'Target-of-Target Sync with UI State Watcher & Debuff Logic'
+addon.version = '.0415'
+addon.desc    = 'Target-of-Target Sync with Guest Detection & Input Safety'
 
 require('common')
 local imgui = require('imgui')
@@ -17,7 +17,7 @@ local refresh_jobs = {
     [15]=true, [16]=true, [21]=true, [22]=true 
 } 
 
--- Internal character table
+-- Core 4 Table
 local chars = {
     { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
@@ -25,12 +25,15 @@ local chars = {
     { name='goomy',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
+-- Dynamic Guest Table
+local guests = {}
+
 ------------------------------------------------------------
 -- INTERNAL STATE
 ------------------------------------------------------------
 local TICK_INTERVAL    = 0.4 
 local ENGAGE_RETRY_GAP = 0.5
-local CAST_LOCK_TIME    = 3.8 
+local CAST_LOCK_TIME   = 3.8 
 local COMP_RETRY_DELAY = 300 
 local lastTick         = 0
 
@@ -39,9 +42,9 @@ local debuff_list      = { "Dia III", "Frazzle III", "Distract III", "Blind II",
 local partyBuffsPtr = AshitaCore:GetPointerManager():Get('party.statusicons')
 partyBuffsPtr = ashita.memory.read_uint32(partyBuffsPtr)
 
-for _, c in ipairs(chars) do
-    c.f_prev, c.step, c.done, c.action_lock = c.f[1], 1, false, 0
-    c.e_prev = c.e[1] 
+local function init_char_state(c)
+    c.f_prev, c.step, c.done, c.action_lock = (c.f and c.f[1] or false), 1, false, 0
+    c.e_prev = (c.e and c.e[1] or false)
     c.lastTarget = 0
     c.lastEngageTime = 0
     c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
@@ -51,6 +54,8 @@ for _, c in ipairs(chars) do
     c.engaged = false
 end
 
+for _, c in ipairs(chars) do init_char_state(c) end
+
 local mm = AshitaCore:GetMemoryManager()
 local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
 
@@ -58,15 +63,14 @@ local qcmd = function(cmd) AshitaCore:GetChatManager():QueueCommand(1, cmd) end
 -- UTILS
 ------------------------------------------------------------
 local function is_in_list(val, list)
+    if not val then return false end
     for _, v in ipairs(list) do if v:lower() == val:lower() then return true end end
     return false
 end
 
-local function scan_party_buffs()
-    local partyMgr = mm:GetParty()
-    if partyBuffsPtr == 0 then return end
-
-    for _, c in ipairs(chars) do
+local function scan_buffs_for_table(t, partyMgr)
+    if not partyMgr or partyBuffsPtr == 0 then return end
+    for _, c in ipairs(t) do
         local h, r, p, comp, pro, sh, hsamba = false, false, false, false, false, false, false
         if c.name:lower() == (partyMgr:GetMemberName(0) or ''):lower() then
             local icons = mm:GetPlayer():GetStatusIcons()
@@ -107,6 +111,38 @@ local function scan_party_buffs()
 end
 
 ------------------------------------------------------------
+-- GUEST WATCHER
+------------------------------------------------------------
+local function update_guests(partyMgr)
+    if not partyMgr then return end
+    local current_party = {}
+    for i = 0, 5 do
+        local name = partyMgr:GetMemberName(i)
+        if name and name ~= "" then current_party[name:lower()] = true end
+    end
+
+    -- Remove guests who left
+    for i = #guests, 1, -1 do
+        if not current_party[guests[i].name:lower()] then table.remove(guests, i) end
+    end
+
+    -- Add new guests
+    for name, _ in pairs(current_party) do
+        local is_core = false
+        for _, core in ipairs(chars) do if core.name:lower() == name then is_core = true break end end
+        
+        local is_known_guest = false
+        for _, gst in ipairs(guests) do if gst.name:lower() == name then is_known_guest = true break end end
+
+        if not is_core and not is_known_guest then
+            local new_guest = { name = name, buf = {false} }
+            init_char_state(new_guest)
+            table.insert(guests, new_guest)
+        end
+    end
+end
+
+------------------------------------------------------------
 -- MAIN LOGIC
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function ()
@@ -115,9 +151,12 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     lastTick = now
 
     if not mm or mm:GetPlayer():GetIsZoning() ~= 0 then return end
-    scan_party_buffs()
-
+    
     local party = mm:GetParty()
+    update_guests(party)
+    scan_buffs_for_table(chars, party)
+    scan_buffs_for_table(guests, party)
+
     local ent   = mm:GetEntity()
     local targ  = mm:GetTarget()
     
@@ -138,32 +177,20 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
     end
 
-    -- v0.4 Target Priority: Hard Target > Target of Target
     local engageTarget = playerTarget
     if engageTarget == 0 and playerTargetOfTarget > 0 then
         engageTarget = playerTargetOfTarget
     end
     
-    ------------------------------------------------------------
-    -- STATE WATCHER (UI Toggle Handling)
-    ------------------------------------------------------------
+    -- State Watcher for Core 4
     for _, c in ipairs(chars) do
         if c.name:lower() ~= 'shaymin' then
-            -- Unchecked 'E' issues /attack off immediately
-            if c.e_prev == true and c.e[1] == false then
-                qcmd(string.format('/mst %s /attack off', c.name))
-            end
+            if c.e_prev == true and c.e[1] == false then qcmd(string.format('/mst %s /attack off', c.name)) end
             c.e_prev = c.e[1]
-
-            -- Follow Toggle Watcher
-            if c.f_prev == false and c.f[1] == true then
-                qcmd(string.format('/mst %s /ms follow on', c.name))
-            elseif c.f_prev == true and c.f[1] == false then
-                qcmd(string.format('/mst %s /ms follow off', c.name))
-            end
+            if c.f_prev == false and c.f[1] == true then qcmd(string.format('/mst %s /ms follow on', c.name))
+            elseif c.f_prev == true and c.f[1] == false then qcmd(string.format('/mst %s /ms follow off', c.name)) end
             c.f_prev = c.f[1]
 
-            -- Update internal 'engaged' status from memory
             local pIdx = -1
             for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
             if pIdx ~= -1 then
@@ -181,15 +208,28 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         local buffTarget = nil
         local targetJob = 0
 
+        -- Priority 1: Mules
         for _, c in ipairs(chars) do
             if c.buf[1] then
                 local pIdx = -1
                 for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
                 local mJob = (pIdx ~= -1) and party:GetMemberMainJob(pIdx) or 0
-                
-                local needs_r = (refresh_jobs[mJob] and not c.buffs.r)
-                if needs_r or not c.buffs.h or not c.buffs.p or not c.buffs.pro or not c.buffs.sh then
+                if (refresh_jobs[mJob] and not c.buffs.r) or not c.buffs.h or not c.buffs.p or not c.buffs.pro or not c.buffs.sh then
                     buffTarget = c; targetJob = mJob; break
+                end
+            end
+        end
+
+        -- Priority 2: Guests
+        if not buffTarget then
+            for _, g in ipairs(guests) do
+                if g.buf[1] then
+                    local pIdx = -1
+                    for x=0,5 do if (party:GetMemberName(x) or ''):lower() == g.name:lower() then pIdx = x break end end
+                    local gJob = (pIdx ~= -1) and party:GetMemberMainJob(pIdx) or 0
+                    if (refresh_jobs[gJob] and not g.buffs.r) or not g.buffs.h or not g.buffs.p or not g.buffs.pro or not g.buffs.sh then
+                        buffTarget = g; targetJob = gJob; break
+                    end
                 end
             end
         end
@@ -197,23 +237,23 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         if buffTarget then
             if not goomy.buffs.comp and (now - goomy.last_cast.comp > COMP_RETRY_DELAY) then
                 qcmd('/mst goomy /ja "Composure" <me>')
-                goomy.last_cast.comp = now; goomy.action_lock = now + 1.5; return
+                goomy.last_cast.comp = now; goomy.action_lock = now + 1.5
+            else
+                if refresh_jobs[targetJob] and not buffTarget.buffs.r then
+                    qcmd(string.format('/mst goomy /ma "Refresh III" %s', buffTarget.name))
+                elseif not buffTarget.buffs.h then
+                    qcmd(string.format('/mst goomy /ma "Haste II" %s', buffTarget.name))
+                elseif not buffTarget.buffs.p then
+                    local s = (buffTarget.name:lower() == 'goomy') and 'Phalanx' or 'Phalanx II'
+                    local t = (buffTarget.name:lower() == 'goomy') and '<me>' or buffTarget.name
+                    qcmd(string.format('/mst goomy /ma "%s" %s', s, t))
+                elseif not buffTarget.buffs.pro then
+                    qcmd(string.format('/mst goomy /ma "Protect V" %s', buffTarget.name))
+                elseif not buffTarget.buffs.sh then
+                    qcmd(string.format('/mst goomy /ma "Shell V" %s', buffTarget.name))
+                end
+                goomy.action_lock = now + CAST_LOCK_TIME
             end
-
-            if refresh_jobs[targetJob] and not buffTarget.buffs.r then
-                qcmd(string.format('/mst goomy /ma "Refresh III" %s', buffTarget.name))
-            elseif not buffTarget.buffs.h then
-                qcmd(string.format('/mst goomy /ma "Haste II" %s', buffTarget.name))
-            elseif not buffTarget.buffs.p then
-                local s = (buffTarget.name:lower() == 'goomy') and 'Phalanx' or 'Phalanx II'
-                local t = (buffTarget.name:lower() == 'goomy') and '<me>' or buffTarget.name
-                qcmd(string.format('/mst goomy /ma "%s" %s', s, t))
-            elseif not buffTarget.buffs.pro then
-                qcmd(string.format('/mst goomy /ma "Protect V" %s', buffTarget.name))
-            elseif not buffTarget.buffs.sh then
-                qcmd(string.format('/mst goomy /ma "Shell V" %s', buffTarget.name))
-            end
-            goomy.action_lock = now + CAST_LOCK_TIME; return
         end
     end
 
@@ -224,50 +264,34 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         local targetName = ent:GetName(engageTarget) or ""
         for i, c in ipairs(chars) do
             if c.name:lower() ~= 'shaymin' and now > c.action_lock then
-                
-                -- 1. Engage Trigger
                 if c.e[1] then 
                     local timeSince = now - c.lastEngageTime
                     if (c.lastTarget ~= engageTarget or not c.engaged) and timeSince >= ENGAGE_RETRY_GAP then
                         qcmd(string.format('/mst %s /attack [t]', c.name))
-                        c.lastTarget = engageTarget
-                        c.lastEngageTime = now
-                        c.action_lock = now + 1.0 
+                        c.lastTarget = engageTarget; c.lastEngageTime = now; c.action_lock = now + 1.0 
                     end
                 end
 
-                -- 2. Target Swap Reset
-                if c.lastTarget ~= engageTarget then
-                    c.step = 1; c.done = false; c.silenced = false; c.lastTarget = engageTarget 
-                end
+                if c.lastTarget ~= engageTarget then c.step = 1; c.done = false; c.silenced = false; c.lastTarget = engageTarget end
                 
                 local pIdx = -1
                 for x=0,5 do if (party:GetMemberName(x) or ''):lower() == c.name:lower() then pIdx = x break end end
                 
                 if pIdx ~= -1 then
-                    -- 3. Goomy Debuff Logic (Runs as long as player is engaged)
                     if c.name:lower() == 'goomy' and c.deb[1] and not c.done then
-                        if targetHPP < 50 then
-                            c.done = true
+                        if targetHPP < 50 then c.done = true
                         else
-                            -- Specific Silence Interrupt
                             if not c.silenced and is_in_list(targetName, silence_whitelist) and c.step > 2 then
                                 qcmd('/mst goomy /ma "Silence" [t]')
-                                c.silenced = true
-                                c.action_lock = now + CAST_LOCK_TIME; return
-                            end
-
-                            local s = debuff_list[c.step]
-                            if s then
-                                qcmd(string.format('/mst goomy /ma "%s" [t]', s))
-                                c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME; return
-                            else 
-                                c.done = true 
+                                c.silenced = true; c.action_lock = now + CAST_LOCK_TIME
+                            else
+                                local s = debuff_list[c.step]
+                                if s then qcmd(string.format('/mst goomy /ma "%s" [t]', s)); c.step = c.step + 1; c.action_lock = now + CAST_LOCK_TIME
+                                else c.done = true end
                             end
                         end
                     end
 
-                    -- 4. Melee/JA Logic (Requires Mule to be actively engaged)
                     if c.engaged then
                         local tp = party:GetMemberTP(pIdx)
                         if c.abs[1] and now > c.abs_last + 45 then
@@ -283,11 +307,8 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
             end
         end
     else
-        -- Clean up state when player disengages
         for _, c in ipairs(chars) do 
-            if c.engaged and c.e[1] and c.name:lower() ~= 'shaymin' then
-                qcmd(string.format('/mst %s /attack off', c.name))
-            end
+            if c.engaged and c.e[1] and c.name:lower() ~= 'shaymin' then qcmd(string.format('/mst %s /attack off', c.name)) end
             c.step = 1; c.done = false; c.silenced = false; c.lastTarget = 0
         end
     end
@@ -305,6 +326,7 @@ ashita.events.register('d3d_present', 'render_ui', function ()
             imgui.TableSetupColumn('HS', 0, 18); imgui.TableSetupColumn('BS', 0, 18); imgui.TableSetupColumn('QS', 0, 18)
             imgui.TableSetupColumn('Ab', 0, 18); imgui.TableSetupColumn('De', 0, 18); imgui.TableSetupColumn('Bu', 0, 18)
             imgui.TableHeadersRow()
+            
             for i, c in ipairs(chars) do
                 imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text(c.name:sub(1,5):upper())
                 imgui.TableNextColumn(); if i ~= 1 then imgui.Checkbox('##F'..i, c.f) else imgui.TextDisabled("-") end
@@ -316,6 +338,14 @@ ashita.events.register('d3d_present', 'render_ui', function ()
                 imgui.TableNextColumn(); if c.name == 'goomy' then imgui.Checkbox('##D'..i, c.deb) else imgui.TextDisabled("-") end
                 imgui.TableNextColumn(); imgui.Checkbox('##U'..i, c.buf)
             end
+
+            for i, g in ipairs(guests) do
+                imgui.TableNextRow(); imgui.TableNextColumn(); imgui.TextColored({0.4, 0.8, 1.0, 1.0}, g.name:sub(1,5):upper())
+                imgui.TableNextColumn(); imgui.TextDisabled("-"); imgui.TableNextColumn(); imgui.TextDisabled("-")
+                imgui.TableNextColumn(); imgui.TextDisabled("-"); imgui.TableNextColumn(); imgui.TextDisabled("-")
+                imgui.TableNextColumn(); imgui.TextDisabled("-"); imgui.TableNextColumn(); imgui.TextDisabled("-")
+                imgui.TableNextColumn(); imgui.TextDisabled("-"); imgui.TableNextColumn(); imgui.Checkbox('##GU'..i, g.buf)
+            end
             imgui.EndTable()
         end
         imgui.End()
@@ -324,7 +354,11 @@ ashita.events.register('d3d_present', 'render_ui', function ()
 end)
 
 ashita.events.register('command', 'cmd_logic', function(e)
-    if e.command:args()[1]:lower() == '/sync' then show_ui = not show_ui; e.blocked = true end
+    local args = e.command:args()
+    if #args > 0 and args[1] and args[1]:lower() == '/sync' then 
+        show_ui = not show_ui
+        e.blocked = true 
+    end
 end)
 
 ashita.events.register('load', 'sync_load', function()
