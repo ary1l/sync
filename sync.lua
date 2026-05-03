@@ -27,11 +27,6 @@ local COLOR_GUEST   = {0.6, 0.9, 1.0, 1.0}
 ------------------------------------------------------------
 local show_ui = true
 
-local ROLES = {
-    main = 'xxxx',
-    rdm  = 'xxxx'
-}
-
 local BUFF_IDS = {
     HASTE = 33, PROTECT = 40, SHELL = 41, REFRESH = 43,
     PHALANX = 116, HASTE_SAMBA = 370, COMPOSURE = 419
@@ -54,10 +49,10 @@ local refresh_jobs = {
 } 
 
 local chars = {
-    { name='shaymin',  f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='muunch',   f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='slowpoke', f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='goomy',    f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='x',  is_main=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='x',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+	{ name='x',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='x',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
 local guests = {}
@@ -304,7 +299,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     if not mm then return end
     
     local player = mm:GetPlayer()
-    if not player then return end -- Failsafe: Ensures we don't crash if addon runs on character select screen
+    if not player then return end
     
     local is_zoning = (player:GetIsZoning() ~= 0)
     
@@ -333,7 +328,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 
     local ent = mm:GetEntity()
     local targ = mm:GetTarget()
-    if not ent or not targ then return end -- Failsafe: Ensure manager entities are active
+    if not ent or not targ then return end 
 
     local selfIdx = party:GetMemberTargetIndex(0)
     local mainEngaged = (selfIdx > 0 and ent:GetStatus(selfIdx) == 1)
@@ -351,7 +346,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     end
 
     local rdm = nil
-    for _, c in ipairs(chars) do if c.name_lower == ROLES.rdm then rdm = c break end end
+    for _, c in ipairs(chars) do if c.is_rdm then rdm = c break end end
 
     if rdm and rdm.in_zone and now > rdm.action_lock then
         local rdmIdx = rdm.pt_data.index
@@ -388,82 +383,85 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         end
 
         ------------------------------------------------------------
-        -- 2. BUFFING
+        -- 2. BUFFING (Haste > Pro > Shell > Phalanx > Refresh)
         ------------------------------------------------------------
         if now > rdm.action_lock then
-            local buffTarget, targetJob = nil, 0
+            local spell_to_cast = nil
+            local target_to_buff = nil
+            local target_name = nil
 
-            local function evaluate_target(t)
-                if t.buf[1] and t.in_zone and t.pt_data then
-                    local in_range = false
-                    local targEntIdx = party:GetMemberTargetIndex(t.pt_data.index)
-                    if t.name_lower == ROLES.rdm then in_range = true
-                    elseif guaranteed_in_range(rdmEntIdx, targEntIdx, 21.0, ent) then in_range = true end
+            -- Priority order of Buff Keys
+            local priority_keys = { 'h', 'pro', 'sh', 'p', 'r' }
+            local spell_map = { h="Haste II", pro="Protect V", sh="Shell V", p="Phalanx II", r="Refresh III" }
 
-                    if in_range then
-                        local job = t.pt_data.job
-                        local rdm_group    = math_floor(rdm.pt_data.index / 6)
-                        local target_group = math_floor(t.pt_data.index / 6)
-                        local is_alliance  = (rdm_group ~= target_group)
+            for _, key in ipairs(priority_keys) do
+                local function find_target_for_spell(list)
+                    for _, t in ipairs(list) do
+                        if t.buf[1] and t.in_zone and t.pt_data then
+                            local rdm_group    = math_floor(rdm.pt_data.index / 6)
+                            local target_group = math_floor(t.pt_data.index / 6)
+                            local same_party   = (rdm_group == target_group)
+                            
+                            -- Range Check
+                            local targEntIdx = party:GetMemberTargetIndex(t.pt_data.index)
+                            local in_range = t.is_rdm or guaranteed_in_range(rdmEntIdx, targEntIdx, 21.0, ent)
 
-                        if not t.buffs.h or not t.buffs.pro or not t.buffs.sh or 
-                          (not is_alliance and refresh_jobs[job] and not t.buffs.r) or 
-                          (not is_alliance and not t.buffs.p) then
-                            buffTarget, targetJob = t, job; return true
+                            if in_range then
+                                local job = t.pt_data.job
+                                rdm.buff_locks[t.name] = rdm.buff_locks[t.name] or {h=0, pro=0, sh=0, p=0, r=0}
+                                local t_locks = rdm.buff_locks[t.name]
+                                local can_read = (t.pt_data.index <= 5)
+
+                                -- Logic checks for specific spells
+                                local valid_spell = true
+                                if key == 'r' and (not same_party or not refresh_jobs[job]) then valid_spell = false end
+                                if key == 'p' and not same_party then valid_spell = false end
+
+                                if valid_spell then
+                                    local needs_buff = false
+                                    if can_read then
+                                        needs_buff = (not t.buffs[key]) and (now - t_locks[key] > BUFF_RETRY_GAP)
+                                    else
+                                        needs_buff = (now - t_locks[key] > BUFF_RETIMER[key])
+                                    end
+
+                                    if needs_buff then
+                                        target_to_buff = t
+                                        target_name = t.name
+                                        spell_to_cast = spell_map[key]
+                                        
+                                        -- Handle self-phalanx
+                                        if key == 'p' and t.is_rdm then 
+                                            spell_to_cast = "Phalanx" 
+                                            target_name = "<me>"
+                                        end
+
+                                        t_locks[key] = now
+                                        return true
+                                    end
+                                end
+                            end
                         end
                     end
+                    return false
                 end
-                return false
+
+                if find_target_for_spell(chars) or find_target_for_spell(guests) then break end
             end
 
-            for _, t in ipairs(chars) do if evaluate_target(t) then break end end
-            if not buffTarget then for _, t in ipairs(guests) do if evaluate_target(t) then break end end end
-
-            if buffTarget then
+            if target_to_buff and rdmMP >= 50 then
                 if not rdm.buffs.comp and (now - rdm.last_cast.comp > COMP_RETRY_DELAY) then
                     do_action(rdm, '/ja "Composure" <me>', 2.0, now, false)
                     rdm.last_cast.comp = now
                 else
-                    local spell_to_cast = nil
-                    local target_name = buffTarget.name
-                    rdm.buff_locks[target_name] = rdm.buff_locks[target_name] or {r=0, h=0, p=0, pro=0, sh=0}
-                    local t_locks = rdm.buff_locks[target_name]
-
-                    local rdm_group    = math_floor(rdm.pt_data.index / 6)
-                    local target_group = math_floor(buffTarget.pt_data.index / 6)
-                    local same_party   = (rdm_group == target_group)
-                    local can_read = (buffTarget.pt_data.index <= 5)
-
-                    local function needs(key, has_buff)
-                        if can_read then return (not has_buff) and (now - t_locks[key] > BUFF_RETRY_GAP)
-                        else return (now - t_locks[key] > BUFF_RETIMER[key]) end
-                    end
-
-                    if not same_party then
-                        if needs('h', buffTarget.buffs.h) then spell_to_cast, t_locks.h = "Haste II", now
-                        elseif needs('pro', buffTarget.buffs.pro) then spell_to_cast, t_locks.pro = "Protect V", now
-                        elseif needs('sh', buffTarget.buffs.sh) then spell_to_cast, t_locks.sh = "Shell V", now end
-                    else
-                        if refresh_jobs[targetJob] and needs('r', buffTarget.buffs.r) then spell_to_cast, t_locks.r = "Refresh III", now
-                        elseif needs('h', buffTarget.buffs.h) then spell_to_cast, t_locks.h = "Haste II", now
-                        elseif needs('p', buffTarget.buffs.p) then
-                            spell_to_cast = (buffTarget.name_lower == ROLES.rdm) and 'Phalanx' or 'Phalanx II'
-                            target_name   = (buffTarget.name_lower == ROLES.rdm) and '<me>' or target_name
-                            t_locks.p = now
-                        elseif needs('pro', buffTarget.buffs.pro) then spell_to_cast, t_locks.pro = "Protect V", now
-                        elseif needs('sh', buffTarget.buffs.sh) then spell_to_cast, t_locks.sh = "Shell V", now end
-                    end
-
-                    if spell_to_cast and rdmMP >= 50 then
-                        do_action(rdm, string_format('/ma "%s" %s', spell_to_cast, target_name), get_cast_delay(spell_to_cast), now, false)
-                    end
+                    do_action(rdm, string_format('/ma "%s" %s', spell_to_cast, target_name), get_cast_delay(spell_to_cast), now, false)
                 end
             end
         end
     end
 
     for _, c in ipairs(chars) do
-        if c.name_lower ~= ROLES.main then
+        if not c.is_main then
             local is_magic_busy = (now <= (c.magic_lock or 0))
             local desired_follow = c.f[1] and not is_magic_busy
             if c.actual_follow ~= desired_follow then
@@ -527,26 +525,41 @@ ashita.events.register('d3d_present', 'render_ui', function ()
             for _, col in ipairs(ui_columns) do imgui.TableSetupColumn(col.label, 0, 18) end
             imgui.TableHeadersRow()
             
+            -- Render Core Characters
             for _, c in ipairs(chars) do
                 imgui.TableNextRow(); imgui.TableNextColumn()
-                local is_main, is_rdm = (c.name_lower == ROLES.main), (c.name_lower == ROLES.rdm)
-                if not c.in_zone then imgui.TextColored(COLOR_OFFLINE, c.disp_name)
-                elseif now <= (c.action_lock or 0) then imgui.TextColored(COLOR_BUSY, c.disp_name) 
-                else imgui.Text(c.disp_name) end
+                
+                -- Status Coloring Logic
+                if not c.in_zone then 
+                    imgui.TextColored(COLOR_OFFLINE, c.disp_name)
+                elseif now <= (c.action_lock or 0) then 
+                    imgui.TextColored(COLOR_BUSY, c.disp_name) 
+                else 
+                    imgui.Text(c.disp_name) 
+                end
                 
                 for _, col in ipairs(ui_columns) do
                     imgui.TableNextColumn()
-                    local can_show = not (is_main and not col.allow_main) and not (col.rdm_only and not is_rdm)
-                    if can_show then imgui.Checkbox(c.ui_ids[col.key], c[col.key]) else imgui.TextDisabled("-") end
+                    local can_show = not (c.is_main and not col.allow_main) and not (col.rdm_only and not c.is_rdm)
+                    if can_show then 
+                        imgui.Checkbox(c.ui_ids[col.key], c[col.key]) 
+                    else 
+                        imgui.TextDisabled("-") 
+                    end
                 end
             end
             
+            -- Render Guests (Dynamic Party Members)
             for _, g in ipairs(guests) do
                 imgui.TableNextRow(); imgui.TableNextColumn()
                 imgui.TextColored(COLOR_GUEST, g.disp_name)
                 for _, col in ipairs(ui_columns) do
                     imgui.TableNextColumn(); 
-                    if col.key == 'buf' then imgui.Checkbox(g.ui_ids[col.key], g[col.key]) else imgui.TextDisabled("-") end
+                    if col.key == 'buf' then 
+                        imgui.Checkbox(g.ui_ids[col.key], g[col.key]) 
+                    else 
+                        imgui.TextDisabled("-") 
+                    end
                 end
             end
             imgui.EndTable()
@@ -558,143 +571,77 @@ end)
 
 ashita.events.register('command', 'cmd_logic', function(e)
     local args = e.command:args()
-    if #args == 0 then return end
-
-    if args[1]:lower() ~= '/sync' then return end
+    if #args == 0 or args[1]:lower() ~= '/sync' then return end
     e.blocked = true
 
-    local cmd  = (args[2] and args[2]:lower()) or nil
-    local arg1 = (args[3] and args[3]:lower()) or nil
-    local arg2 = (args[4] and args[4]:lower()) or nil
+    -- Toggle UI with just /sync
+    if #args == 1 then
+        show_ui = not show_ui
+        return
+    end
 
-    ------------------------------------------------------------
-    -- helper: resolve target
-    ------------------------------------------------------------
+    local commands = { 
+        f = 'f', follow = 'f', e = 'e',
+        d = 'deb', de = 'deb', deb = 'deb',
+        buf = 'buf', buff = 'buf', b = 'buf',
+        qs = 'qs', bs = 'bs', abs = 'abs', hs = 'hs'
+    }
+
+    local arg2 = args[2] and args[2]:lower()
+    local arg3 = args[3] and args[3]:lower()
+    local arg4 = args[4] and args[4]:lower()
+
+    local cmd, target_raw, state_raw
+
+    -- Smart Parsing (Handles shorthand like /sync f on)
+    if commands[arg2] then
+        cmd, target_raw, state_raw = commands[arg2], 'all', arg3
+    elseif arg2 == 'all' or arg2 == 'ui' then
+        target_raw, cmd, state_raw = arg2, commands[arg3] or arg3, arg4
+    else
+        target_raw, cmd, state_raw = arg2, commands[arg3] or arg3, arg4
+    end
+
+    if target_raw == 'ui' then
+        show_ui = (state_raw == 'on') or (not state_raw and not show_ui)
+        return
+    end
+
+    -- Prefix Matching for Character Names
     local function resolve(name)
         if not name or name == 'all' then return 'all' end
         for _, c in ipairs(chars) do
-            if c.name_lower == name then
-                return c
-            end
+            if c.name_lower:sub(1, #name) == name then return c end
         end
         return nil
     end
 
-    local function apply(target, fn)
+    local target = resolve(target_raw)
+    
+    -- Determine state: true (on), false (off), or nil (toggle)
+    local state = nil
+    if state_raw == 'on' then state = true
+    elseif state_raw == 'off' then state = false end
+
+    local function apply(key, val)
+        if not key then return end
         if target == 'all' then
-            for _, c in ipairs(chars) do fn(c) end
-        elseif target then
-            fn(target)
+            for _, c in ipairs(chars) do
+                if c[key] then 
+                    -- Toggle if val is nil, otherwise set absolute
+                    c[key][1] = (val == nil) and (not c[key][1]) or val 
+                end
+            end
+        elseif target and target[key] then
+            target[key][1] = (val == nil) and (not target[key][1]) or val
+            if key == 'f' then target.actual_follow = nil end
         end
     end
 
-    ------------------------------------------------------------
-    -- UI TOGGLE (BACKWARD COMPATIBLE)
-    -- /sync  -> toggle UI
-    -- /sync ui on/off
-    ------------------------------------------------------------
-    if not cmd or cmd == 'ui' then
-        if not arg1 then
-            show_ui = not show_ui
-        elseif arg1 == 'on' then
-            show_ui = true
-        elseif arg1 == 'off' then
-            show_ui = false
-        end
-        return
-    end
-
-    ------------------------------------------------------------
-    -- FOLLOW
-    -- /sync follow all off
-    -- /sync follow XXXXX on
-    ------------------------------------------------------------
-    if cmd == 'follow' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.f[1] = state
-        end)
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- BUFF MODE
-    -- /sync buff all
-    -- /sync buff XXXX off
-    ------------------------------------------------------------
-    if cmd == 'buff' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.buf[1] = state
-        end)
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- Haste Samba
-    -- /sync hs XXXXX
-    -- /sync hs all off
-    ------------------------------------------------------------
-    if cmd == 'hs' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.hs[1] = state
-        end)
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- BoxStep 
-    ------------------------------------------------------------
-    if cmd == 'bs' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.bs[1] = state
-        end)
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- QuickStep
-    ------------------------------------------------------------
-    if cmd == 'qs' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.qs[1] = state
-        end)
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- AbsorbTP
-    ------------------------------------------------------------
-    if cmd == 'abs' then
-        local target = resolve(arg1)
-        local state  = (arg2 ~= 'off')
-
-        apply(target, function(c)
-            c.abs[1] = state
-        end)
-
-        return
-    end
+    apply(cmd, state)
 end)
 
 ashita.events.register('load', 'sync_load', function()
     qcmd('/ms followme on', true)
     qcmd('/mso /ms follow on', true)
+end)
