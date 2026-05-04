@@ -1,7 +1,7 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.050326'
-addon.desc    = 'sync'
+addon.version = '.050326_v6'
+addon.desc    = 'full sync fixed syntax'
 
 require('common')
 local imgui = require('imgui')
@@ -10,7 +10,7 @@ local imgui = require('imgui')
 -- LUA OPTIMIZATIONS
 ------------------------------------------------------------
 local os_clock      = os.clock
-local math_sqrt      = math.sqrt
+local math_sqrt     = math.sqrt
 local math_floor    = math.floor
 local string_format = string.format
 local bit_lshift    = bit.lshift
@@ -35,7 +35,7 @@ local BUFF_IDS = {
 }
 
 local JOB_IDS = {
-    WHM = 3, BLM = 4, RDM = 5, BRD = 6, PLD = 7, DRK = 8,
+    WHM = 3, BLM = 4, RDM = 5, PLD = 7, DRK = 8,
     SMN = 15, BLU = 16, GEO = 21, RUN = 22
 }
 
@@ -46,21 +46,22 @@ local silence_whitelist = {
 
 local refresh_jobs = {
     [JOB_IDS.WHM] = true, [JOB_IDS.BLM] = true, [JOB_IDS.RDM] = true,
-    [JOB_IDS.BRD] = true, [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, 
-    [JOB_IDS.SMN] = true, [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, 
-    [JOB_IDS.RUN] = true
+    [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, [JOB_IDS.SMN] = true, 
+    [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, [JOB_IDS.RUN] = true
 }
 
 local chars = {
     { name='shaymin',  is_main=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='goomy',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='muunch',                  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
-    { name='slowpoke',                f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='muunch',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='slowpoke',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
 local guests = {}
 local current_active = {}
 local known_cores = {}
+local buff_cache = {}
+local debuff_queue = {}
 
 local ui_columns = {
     { label = 'F',  key = 'f',   allow_main = false, rdm_only = false },
@@ -74,31 +75,40 @@ local ui_columns = {
 }
 
 ------------------------------------------------------------
--- BUFF DURATIONS & RETRY LOGIC
+-- CACHE & QUEUE HELPERS
 ------------------------------------------------------------
-local BUFF_RETIMER = {
-    r   = 300,   -- Refresh III
-    h   = 270,   -- Haste II
-    p   = 270,   -- Phalanx II
-    pro = 3300,  -- Protect V
-    sh  = 3300,  -- Shell V
-}
-local BUFF_RETRY_GAP = 8.0
+local function get_cache(t)
+    local id = t.name_lower
+    buff_cache[id] = buff_cache[id] or {}
+    return buff_cache[id]
+end
+
+local function get_debuff_queue(name)
+    if not debuff_queue[name] then
+        debuff_queue[name] = {
+            { name="Silence", done=false },
+            { name="Dia III", done=false },
+            { name="Frazzle III", done=false },
+            { name="Distract III", done=false },
+        }
+    end
+    return debuff_queue[name]
+end
 
 ------------------------------------------------------------
--- CASTING & DELAY CALCULATIONS
+-- DURATIONS & CASTING
 ------------------------------------------------------------
+local BUFF_RETIMER = { r=300, h=270, p=270, pro=3300, sh=3300 }
+local BUFF_RETRY_GAP = 8.0
 local RDM_FAST_CAST  = 0.50
 local ANIMATION_LOCK = 2.3
 
 local SPELL_CAST_TIMES = {
-    ["Refresh III"] = 3.0,  ["Haste II"]      = 3.0,
-    ["Phalanx II"]  = 3.0,  ["Phalanx"]       = 3.0,
-    ["Protect V"]   = 3.0,  ["Shell V"]        = 3.0,
-    ["Silence"]     = 3.0,  ["Dia III"]        = 2.5,
-    ["Frazzle III"] = 3.0,  ["Distract III"]   = 3.0,
-    ["Blind II"]    = 3.0,  ["Slow II"]        = 3.0,
-    ["Paralyze II"] = 3.0,
+    ["Refresh III"] = 3.0,  ["Haste II"] = 3.0,
+    ["Phalanx II"] = 3.0,   ["Phalanx"] = 3.0,
+    ["Protect V"] = 3.0,    ["Shell V"] = 3.0,
+    ["Silence"] = 3.0,      ["Dia III"] = 2.5,
+    ["Frazzle III"] = 3.0,  ["Distract III"] = 3.0,
 }
 
 local function get_cast_delay(spell)
@@ -109,178 +119,17 @@ end
 local function get_yalms(entIdx, ent)
     if not entIdx or entIdx == 0 then return 999 end
     local dSq = ent:GetDistance(entIdx)
-    if not dSq or dSq < 0 then return 999 end
-    return math_sqrt(dSq)
-end
-
-local function guaranteed_in_range(casterIdx, targetIdx, max_yalms, ent)
-    if not casterIdx or not targetIdx then return false end
-    local d1 = get_yalms(casterIdx, ent)
-    local d2 = get_yalms(targetIdx, ent)
-    return (d1 + d2) <= max_yalms
+    return dSq and math_sqrt(dSq) or 999
 end
 
 ------------------------------------------------------------
--- INTERNAL STATE & SAFETY
+-- STATE UTILS
 ------------------------------------------------------------
-local TICK_ACTION      = 0.1
-local TICK_SCAN        = 0.5
-local ENGAGE_RETRY_GAP = 0.5
-local COMP_RETRY_DELAY = 10
-local lastTick         = 0
-local lastScanTick     = 0
-local is_zoning_prev   = false
-
-local debuff_list = { "Dia III", "Distract III" }
-
 local qcmd = function(cmd, isFollow)
     local mm = AshitaCore:GetMemoryManager()
     local player = mm:GetPlayer()
     if not isFollow and player and player:GetIsZoning() ~= 0 then return end
     AshitaCore:GetChatManager():QueueCommand(1, cmd)
-end
-
-local function init_char_state(c)
-    c.name_lower    = c.name:lower()
-    c.disp_name     = c.name:sub(1,5):upper()
-    c.actual_follow = (c.f and c.f[1] or false)
-    c.step, c.done, c.action_lock, c.magic_lock = 1, false, 0, 0
-    c.e_prev        = (c.e and c.e[1] or false)
-    c.lastTarget, c.lastEngageTime = 0, 0
-    c.lastDebuffTarget     = 0
-    c.lastDebuffTargetName = ""
-    c.debuff_wait   = 0
-    c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
-    c.buffs     = { h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false }
-    c.last_cast = { comp=0 }
-    c.buff_locks    = {}
-    c.engaged, c.in_zone, c.silenced = false, false, false
-    c.pt_data   = nil
-    c.entIdx    = 0
-    c.next_step     = "Box Step"
-    c.low_mp_mode   = false
-    c.ui_ids    = {}
-    for _, col in ipairs(ui_columns) do
-        c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower
-    end
-end
-
-for _, c in ipairs(chars) do
-    init_char_state(c)
-    known_cores[c.name_lower] = true
-end
-
-------------------------------------------------------------
--- SCANNING & UTILITY
-------------------------------------------------------------
-local function update_membership_and_zones(party)
-    if not party then return nil end
-    local my_zone = party:GetMemberZone(0)
-    for _, v in pairs(current_active) do v.active_this_scan = false end
-
-    for i = 0, 17 do
-        local name = party:GetMemberName(i)
-        if name and name ~= "" then
-            local zId      = party:GetMemberZone(i)
-            local sId      = party:GetMemberServerId(i)
-            local isActive = party:GetMemberIsActive(i)
-            if sId ~= 0 and isActive ~= 0 and zId == my_zone then
-                local name_l = name:lower()
-                if not current_active[name_l] then current_active[name_l] = {} end
-                local ca = current_active[name_l]
-                ca.index            = i
-                ca.job              = party:GetMemberMainJob(i)
-                ca.sId              = sId
-                ca.active_this_scan = true
-            end
-        end
-    end
-
-    for k, v in pairs(current_active) do
-        if not v.active_this_scan then current_active[k] = nil end
-    end
-
-    for _, c in ipairs(chars) do
-        c.pt_data = current_active[c.name_lower]
-        c.in_zone = (c.pt_data ~= nil)
-    end
-
-    for i = #guests, 1, -1 do
-        local g = guests[i]
-        g.pt_data = current_active[g.name_lower]
-        if not g.pt_data then table.remove(guests, i)
-        else g.in_zone = true end
-    end
-
-    for name_l, data in pairs(current_active) do
-        local is_known = known_cores[name_l]
-        if not is_known then
-            for _, gst in ipairs(guests) do if gst.name_lower == name_l then is_known = true; break end end
-        end
-        if not is_known then
-            local properName = party:GetMemberName(data.index)
-            local g = { name = properName, buf = {false} }
-            init_char_state(g)
-            g.in_zone, g.pt_data = true, data
-            for _, col in ipairs(ui_columns) do g.ui_ids[col.key] = '##G' .. col.label .. '_' .. g.name_lower end
-            table.insert(guests, g)
-        end
-    end
-end
-
-local function parse_buff(b, buffs)
-    if      b == BUFF_IDS.HASTE       then buffs.h      = true
-    elseif b == BUFF_IDS.REFRESH     then buffs.r      = true
-    elseif b == BUFF_IDS.PHALANX     then buffs.p      = true
-    elseif b == BUFF_IDS.COMPOSURE   then buffs.comp   = true
-    elseif b == BUFF_IDS.PROTECT     then buffs.pro    = true
-    elseif b == BUFF_IDS.SHELL       then buffs.sh     = true
-    elseif b == BUFF_IDS.HASTE_SAMBA then buffs.hsamba = true
-    end
-end
-
-local function scan_buffs(t, partyMgr, player)
-    local ptr_mgr = AshitaCore:GetPointerManager()
-    local pPtr = ptr_mgr:Get('party.statusicons')
-    if pPtr == 0 then return end
-
-    local partyBuffsPtr = ashita.memory.read_uint32(pPtr)
-    if not partyMgr or partyBuffsPtr == 0 then return end
-
-    local myNameL = (partyMgr:GetMemberName(0) or ''):lower()
-
-    for _, c in ipairs(t) do
-        if not c.in_zone then goto continue end
-        c.buffs.h, c.buffs.r, c.buffs.p, c.buffs.comp,
-        c.buffs.pro, c.buffs.sh, c.buffs.hsamba = false, false, false, false, false, false, false
-
-        if c.name_lower == myNameL and player then
-            local buffs = player:GetBuffs()
-            if buffs then
-                for i = 0, 31 do
-                    local b = buffs[i]
-                    if not b or b <= 0 or b == 255 then break end
-                    parse_buff(b, c.buffs)
-                end
-            end
-        elseif c.pt_data then
-            local sId = c.pt_data.sId
-            for slot = 0, 5 do
-                local mPtr = partyBuffsPtr + (0x30 * slot)
-                if mPtr ~= 0 and ashita.memory.read_uint32(mPtr) == sId then
-                    for j = 0, 31 do
-                        local low = ashita.memory.read_uint8(mPtr + 16 + j)
-                        if low == 255 then break end
-                        local high = ashita.memory.read_uint8(mPtr + 8 + math_floor(j / 4))
-                        high = bit_lshift(bit_band(bit_rshift(high, (j % 4) * 2), 0x03), 8)
-                        parse_buff(high + low, c.buffs)
-                    end
-                    break
-                end
-            end
-        end
-        ::continue::
-    end
 end
 
 local function do_action(c, cmd, lock_time, current_time, stop_movement)
@@ -293,32 +142,113 @@ local function do_action(c, cmd, lock_time, current_time, stop_movement)
     if stop_movement then c.magic_lock = current_time + lock_time end
 end
 
-------------------------------------------------------------
--- ALLIANCE CYCLE COMPLETION CHECK
--- Ensures Haste, Protect, Shell, and applicable Phalanx/Refresh are cast
-------------------------------------------------------------
-local function check_alliance_cycle_done(t, rdm)
-    local tl = rdm.buff_locks[t.name]
-    if not tl then return end
-    
-    local rdm_grp = math_floor(rdm.pt_data.index / 6)
-    local t_grp   = math_floor(t.pt_data.index / 6)
-    local same_party = (rdm_grp == t_grp)
+local function init_char_state(c)
+    c.name_lower = c.name:lower()
+    c.disp_name = c.name:sub(1,5):upper()
+    c.actual_follow = (c.f and c.f[1] or false)
+    c.action_lock, c.magic_lock = 0, 0
+    c.lastTarget, c.lastEngageTime = 0, 0
+    c.lastDebuffTarget = 0
+    c.lastDebuffTargetName = ""
+    c.buff_locks = {}
+    c.low_mp_mode = false
+    c.buffs = { h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false }
+    c.ui_ids = {}
+    for _, col in ipairs(ui_columns) do c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower end
+end
 
-    local core_done = (tl.h or 0) > 0 and (tl.pro or 0) > 0 and (tl.sh or 0) > 0
-    local refresh_done = (not same_party or not refresh_jobs[t.pt_data.job] or (tl.r or 0) > 0)
-    local phalanx_done = (not same_party or (tl.p or 0) > 0)
+for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower]=true end
 
-    if core_done and refresh_done and phalanx_done then
-        t.buf[1] = false
-        rdm.buff_locks[t.name] = { h=0, pro=0, sh=0, p=0, r=0 }
+------------------------------------------------------------
+-- SCANNING
+------------------------------------------------------------
+local function update_membership_and_zones(party)
+    local my_zone = party:GetMemberZone(0)
+    for _, v in pairs(current_active) do v.active_this_scan = false end
+    for i = 0, 17 do
+        local name = party:GetMemberName(i)
+        if name and name ~= "" then
+            local zId = party:GetMemberZone(i)
+            local sId = party:GetMemberServerId(i)
+            if sId ~= 0 and party:GetMemberIsActive(i) ~= 0 and zId == my_zone then
+                local nl = name:lower()
+                current_active[nl] = { index=i, job=party:GetMemberMainJob(i), sId=sId, active_this_scan=true }
+            end
+        end
+    end
+    for k, v in pairs(current_active) do if not v.active_this_scan then current_active[k] = nil end end
+    for _, c in ipairs(chars) do c.pt_data = current_active[c.name_lower]; c.in_zone = (c.pt_data ~= nil) end
+    for i = #guests, 1, -1 do
+        guests[i].pt_data = current_active[guests[i].name_lower]
+        if not guests[i].pt_data then table.remove(guests, i) else guests[i].in_zone = true end
+    end
+    for nl, data in pairs(current_active) do
+        local known = known_cores[nl]
+        if not known then for _, g in ipairs(guests) do if g.name_lower == nl then known = true break end end end
+        if not known then
+            local g = { name = party:GetMemberName(data.index), buf = {false} }
+            init_char_state(g); g.in_zone, g.pt_data = true, data
+            table.insert(guests, g)
+        end
+    end
+end
+
+local function scan_buffs(t, party, player)
+    local ptr = AshitaCore:GetPointerManager():Get('party.statusicons')
+    if ptr == 0 then return end
+    local buff_ptr = ashita.memory.read_uint32(ptr)
+    if buff_ptr == 0 then return end
+    local myNameL = (party:GetMemberName(0) or ''):lower()
+
+    for _, c in ipairs(t) do
+        if not c.in_zone then goto skip end
+        c.buffs = { h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false }
+        if c.name_lower == myNameL then
+            local b = player:GetBuffs()
+            for i=0,31 do
+                local id = b[i]
+                if id == BUFF_IDS.HASTE then c.buffs.h=true
+                elseif id == BUFF_IDS.REFRESH then c.buffs.r=true
+                elseif id == BUFF_IDS.PHALANX then c.buffs.p=true
+                elseif id == BUFF_IDS.COMPOSURE then c.buffs.comp=true
+                elseif id == BUFF_IDS.PROTECT then c.buffs.pro=true
+                elseif id == BUFF_IDS.SHELL then c.buffs.sh=true
+                elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.hsamba=true end
+            end
+        elseif c.pt_data then
+            for slot=0,5 do
+                local m = buff_ptr + (0x30 * slot)
+                if ashita.memory.read_uint32(m) == c.pt_data.sId then
+                    for j=0,31 do
+                        local low = ashita.memory.read_uint8(m + 16 + j)
+                        if low == 255 then break end
+                        local high = bit_lshift(bit_band(bit_rshift(ashita.memory.read_uint8(m + 8 + math_floor(j/4)), (j%4)*2), 0x03), 8)
+                        local id = high + low
+                        if id == BUFF_IDS.HASTE then c.buffs.h=true
+                        elseif id == BUFF_IDS.REFRESH then c.buffs.r=true
+                        elseif id == BUFF_IDS.PHALANX then c.buffs.p=true
+                        elseif id == BUFF_IDS.COMPOSURE then c.buffs.comp=true
+                        elseif id == BUFF_IDS.PROTECT then c.buffs.pro=true
+                        elseif id == BUFF_IDS.SHELL then c.buffs.sh=true
+                        elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.hsamba=true end
+                    end
+                    break
+                end
+            end
+        end
+        ::skip::
     end
 end
 
 ------------------------------------------------------------
--- MAIN LOGIC LOOP
+-- CORE LOGIC
 ------------------------------------------------------------
-ashita.events.register('d3d_present', 'logic_loop', function ()
+local TICK_ACTION = 0.1
+local TICK_SCAN   = 0.5
+local lastTick, lastScanTick = 0, 0
+local is_zoning_prev = false
+
+ashita.events.register('d3d_present', 'logic_loop', function()
     local now = os_clock()
     if now - lastTick < TICK_ACTION then return end
     lastTick = now
@@ -328,16 +258,11 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
     local player, party, ent, targ = mm:GetPlayer(), mm:GetParty(), mm:GetEntity(), mm:GetTarget()
     if not player or not party or not ent or not targ then return end
 
-    local is_zoning = (player:GetIsZoning() ~= 0)
-    if is_zoning and not is_zoning_prev then
-        guests = {}
-        for _, c in ipairs(chars) do
-            c.step, c.done, c.in_zone, c.pt_data, c.actual_follow = 1, false, false, nil, c.f[1]
-            c.buff_locks, c.low_mp_mode = {}, false
-        end
+    if player:GetIsZoning() ~= 0 then 
+        is_zoning_prev = true return 
+    elseif is_zoning_prev then
+        guests = {}; buff_cache = {}; debuff_queue = {}; is_zoning_prev = false
     end
-    is_zoning_prev = is_zoning
-    if is_zoning then return end
 
     if now - lastScanTick >= TICK_SCAN then
         update_membership_and_zones(party)
@@ -345,183 +270,112 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         lastScanTick = now
     end
 
-    local selfIdx = party:GetMemberTargetIndex(0)
-    
-    -- Track leader/main engagement instead of local window engagement
-    local main_char = nil
-    for _, c in ipairs(chars) do if c.is_main then main_char = c; break end end
-    local main_idx = (main_char and main_char.pt_data) and party:GetMemberTargetIndex(main_char.pt_data.index) or selfIdx
-    local mainEngaged = (main_idx > 0 and ent:GetStatus(main_idx) == 1)
-
-    local engageTarget, targetHPP = 0, 0
-    if main_idx > 0 then
-        local pt = (main_idx == selfIdx) and targ:GetTargetIndex(targ:GetIsSubTargetActive()) or 0
-        if pt == 0 then pt = ent:GetTargetedIndex(main_idx) end
-        if pt > 0 then engageTarget, targetHPP = pt, ent:GetHPPercent(pt) end
-    end
-
     local rdm = nil
-    for _, c in ipairs(chars) do if c.is_rdm then rdm = c; break end end
+    for _, c in ipairs(chars) do if c.is_rdm then rdm = c break end end
+    
+    -- Main's Target Logic
+    local main_char = nil
+    for _, c in ipairs(chars) do if c.is_main then main_char = c break end end
+    local main_idx = (main_char and main_char.pt_data) and party:GetMemberTargetIndex(main_char.pt_data.index) or party:GetMemberTargetIndex(0)
+    local mainEngaged = (main_idx > 0 and ent:GetStatus(main_idx) == 1)
+    local engageTarget = mainEngaged and ent:GetTargetedIndex(main_idx) or 0
 
+    ------------------------------------------------------------
+    -- RDM LOGIC
+    ------------------------------------------------------------
     if rdm and rdm.in_zone and now > rdm.action_lock then
-        local rdmIdx    = rdm.pt_data.index
-        local rdmMP      = party:GetMemberMP(rdmIdx) or 0
-        local rdmEntIdx = party:GetMemberTargetIndex(rdmIdx)
-
+        local rdmIdx = rdm.pt_data.index
+        local rdmMP = party:GetMemberMP(rdmIdx) or 0
+        
         -- MP Hysteresis
-        if rdmMP < 200 then rdm.low_mp_mode = true
-        elseif rdmMP >= 450 then rdm.low_mp_mode = false end
+        if rdmMP < 200 and not rdm.low_mp_mode then 
+            rdm.low_mp_mode = true
+        elseif rdmMP >= 450 and rdm.low_mp_mode then 
+            rdm.low_mp_mode = false 
+        end
 
-        if not rdm.low_mp_mode then
-            ------------------------------------------------------------
-            -- 1. DEBUFFING
-            ------------------------------------------------------------
-            if rdm.deb[1] and mainEngaged and targetHPP >= 10 then
-                if rdm.lastDebuffTarget ~= engageTarget then
-                    rdm.step, rdm.done, rdm.silenced, rdm.lastDebuffTarget = 1, false, false, engageTarget
-                    rdm.debuff_wait = now + 0.45
-                    local tNameRaw = ent:GetName(engageTarget)
-                    rdm.lastDebuffTargetName = tNameRaw and tNameRaw:lower() or ""
-                end
+        if rdm.low_mp_mode then goto SKIP_RDM_BUFF end
 
-                if not rdm.done and now > (rdm.debuff_wait or 0) then
-                    if guaranteed_in_range(rdmEntIdx, engageTarget, 21.0, ent) and rdmMP >= 40 then
-                        if not rdm.silenced and silence_whitelist[rdm.lastDebuffTargetName] then
-                            do_action(rdm, '/ma "Silence" [t]', get_cast_delay("Silence"), now, true)
-                            rdm.silenced = true
-                        else
-                            local s = debuff_list[rdm.step]
-                            if s then
-                                do_action(rdm, string_format('/ma "%s" [t]', s), get_cast_delay(s), now, true)
-                                rdm.step = rdm.step + 1
-                            else rdm.done = true end
-                        end
-                    end
-                end
+        -- Debuff Queue
+        if rdm.deb[1] and engageTarget > 0 and ent:GetHPPercent(engageTarget) > 5 then
+            if rdm.lastDebuffTarget ~= engageTarget then
+                rdm.lastDebuffTarget = engageTarget
+                local tName = ent:GetName(engageTarget)
+                rdm.lastDebuffTargetName = tName and tName:lower() or ""
             end
-
-            ------------------------------------------------------------
-            -- 2. BUFFING (PRIORITY: SELF > PARTY > ALLIANCE > GUESTS)
-            ------------------------------------------------------------
-            if now > rdm.action_lock then
-                local spell_to_cast, target_name = nil, nil
-                local spell_map = { h="Haste II", pro="Protect V", sh="Shell V", p="Phalanx II", r="Refresh III" }
-
-                rdm.buff_locks[rdm.name] = rdm.buff_locks[rdm.name] or { h=0, pro=0, sh=0, p=0, r=0 }
-
-                local function check_needs(t, key)
-                    if not t or not t.in_zone or not t.pt_data or not t.buf[1] then return false end
-
-                    local rdm_grp    = math_floor(rdm.pt_data.index / 6)
-                    local t_grp      = math_floor(t.pt_data.index / 6)
-                    local same_party = (rdm_grp == t_grp)
-                    local targEntIdx = party:GetMemberTargetIndex(t.pt_data.index)
-                    if not (t.is_rdm or guaranteed_in_range(rdmEntIdx, targEntIdx, 21.0, ent)) then return false end
-
-                    if key == 'r' and (not same_party or not refresh_jobs[t.pt_data.job]) then return false end
-                    if key == 'p' and not same_party then return false end
-
-                    rdm.buff_locks[t.name] = rdm.buff_locks[t.name] or { h=0, pro=0, sh=0, p=0, r=0 }
-                    local t_locks = rdm.buff_locks[t.name]
-
-                    if t.pt_data.index <= 5 then
-                        return (not t.buffs[key]) and (now - t_locks[key] > BUFF_RETRY_GAP)
-                    else
-                        return ((not t.buffs[key]) and (now - t_locks[key] > BUFF_RETRY_GAP))
-                            or (now - t_locks[key] > BUFF_RETIMER[key])
-                    end
-                end
-
-                -- SELF PRIORITY
-                for _, k in ipairs({'h', 'r'}) do
-                    if check_needs(rdm, k) then
-                        spell_to_cast, target_name = spell_map[k], "<me>"
-                        rdm.buff_locks[rdm.name][k] = now; break
-                    end
-                end
-
-                -- PARTY / ALLIANCE / GUEST PRIORITY
-                if not spell_to_cast then
-                    for _, key in ipairs({'h', 'pro', 'sh', 'p', 'r'}) do
-                        local found = false
-                        for _, t in ipairs(chars) do
-                            if t.pt_data and t.pt_data.index <= 5 and check_needs(t, key) then
-                                spell_to_cast = spell_map[key]; target_name = t.name
-                                if key == 'p' and t.is_rdm then spell_to_cast, target_name = "Phalanx", "<me>" end
-                                rdm.buff_locks[t.name][key] = now
-                                found = true; break
-                            end
+            local q = get_debuff_queue(rdm.lastDebuffTargetName)
+            if get_yalms(engageTarget, ent) < 21.0 then
+                for _, d in ipairs(q) do
+                    if not d.done then
+                        if d.name == "Silence" and not silence_whitelist[rdm.lastDebuffTargetName] then
+                            d.done = true
+                        else
+                            do_action(rdm, string_format('/ma "%s" <t>', d.name), get_cast_delay(d.name), now, true)
+                            d.done = true
+                            goto SKIP_RDM_BUFF
                         end
-                        if not found then
-                            for _, t in ipairs(chars) do
-                                if t.pt_data and t.pt_data.index > 5 and check_needs(t, key) then
-                                    spell_to_cast = spell_map[key]; target_name = t.name
-                                    rdm.buff_locks[t.name][key] = now
-                                    check_alliance_cycle_done(t, rdm)
-                                    found = true; break
-                                end
-                            end
-                        end
-                        if not found then
-                            for _, t in ipairs(guests) do
-                                if check_needs(t, key) then
-                                    spell_to_cast = spell_map[key]; target_name = t.name
-                                    rdm.buff_locks[t.name][key] = now
-                                    if t.pt_data.index > 5 then check_alliance_cycle_done(t, rdm) end
-                                    found = true; break
-                                end
-                            end
-                        end
-                        if found then break end
-                    end
-                end
-
-                if spell_to_cast and rdmMP >= 50 then
-                    if not rdm.buffs.comp and (now - (rdm.last_cast.comp or 0) > COMP_RETRY_DELAY) then
-                        do_action(rdm, '/ja "Composure" <me>', 1.5, now, false)
-                        rdm.last_cast.comp = now
-                    else
-                        do_action(rdm, string_format('/ma "%s" %s', spell_to_cast, target_name), get_cast_delay(spell_to_cast), now, false)
                     end
                 end
             end
         end
-    end
 
-    -- Character Actions
+        -- Buff Logic
+        local function check_needs(t, key)
+            if not t or not t.in_zone or not t.buf[1] then return false end
+            local cache = get_cache(t)
+            local tEntIdx = party:GetMemberTargetIndex(t.pt_data.index)
+            if not (t.is_rdm or get_yalms(tEntIdx, ent) < 21.0) then return false end
+            if key == 'r' and not refresh_jobs[t.pt_data.job] then return false end
+            if t.buffs[key] then cache[key] = now + BUFF_RETIMER[key] return false end
+            if cache[key] and now < cache[key] then return false end
+            rdm.buff_locks[t.name] = rdm.buff_locks[t.name] or {}
+            if now - (rdm.buff_locks[t.name][key] or 0) < BUFF_RETRY_GAP then return false end
+            return true
+        end
+
+        local spell_map = { h="Haste II", pro="Protect V", sh="Shell V", p="Phalanx II", r="Refresh III" }
+        local bKey, bTarget = nil, nil
+        for _, key in ipairs({"h","r","pro","sh","p"}) do
+            for _, t in ipairs(chars) do if check_needs(t, key) then bKey, bTarget = key, t goto found end end
+            for _, g in ipairs(guests) do if check_needs(g, key) then bKey, bTarget = key, g goto found end end
+        end
+        ::found::
+
+        if bKey and bTarget and rdmMP > 50 then
+            if not rdm.buffs.comp then
+                do_action(rdm, '/ja "Composure" <me>', 1.5, now, false)
+            else
+                local spell = (bKey == 'p' and bTarget.is_rdm) and "Phalanx" or spell_map[bKey]
+                local tName = (bTarget.name == rdm.name) and "<me>" or bTarget.name
+                rdm.buff_locks[bTarget.name][bKey] = now
+                get_cache(bTarget)[bKey] = now + BUFF_RETIMER[bKey]
+                do_action(rdm, string_format('/ma "%s" %s', spell, tName), get_cast_delay(spell), now, false)
+            end
+        end
+    end
+    ::SKIP_RDM_BUFF::
+    do end -- Necessary statement after label
+
+    ------------------------------------------------------------
+    -- CHARACTER ACTIONS
+    ------------------------------------------------------------
     for _, c in ipairs(chars) do
         if not c.is_main then
-            local is_magic_busy = (now <= (c.magic_lock or 0))
-            if c.actual_follow ~= (c.f[1] and not is_magic_busy) then
-                c.actual_follow = c.f[1] and not is_magic_busy
-                qcmd(string_format('/mst %s /ms follow %s', c.name, c.actual_follow and 'on' or 'off'), true)
-            end
-
             if c.in_zone and c.pt_data and now > c.action_lock then
                 local pIdx = c.pt_data.index
-                c.entIdx   = party:GetMemberTargetIndex(pIdx)
-                local mIdx = c.entIdx
-                c.engaged  = (mIdx > 0 and ent:GetStatus(mIdx) == 1)
-
-                if mainEngaged and c.e[1] then
-                    if (c.lastTarget ~= engageTarget or not c.engaged) and (now - c.lastEngageTime > ENGAGE_RETRY_GAP) then
-                        do_action(c, '/attack [t]', 1.2, now, false)
-                        c.lastTarget, c.lastEngageTime = engageTarget, now
-                    end
-                elseif (not mainEngaged or not c.e[1]) and c.engaged then
-                    qcmd(string_format('/mst %s /attack off', c.name))
-                end
+                c.entIdx = party:GetMemberTargetIndex(pIdx)
+                c.engaged = (c.entIdx > 0 and ent:GetStatus(c.entIdx) == 1)
 
                 if c.engaged then
-                    local tp, cEntIdx = party:GetMemberTP(pIdx), c.entIdx
-                    if c.abs[1] and guaranteed_in_range(cEntIdx, mIdx, 21.0, ent) and now > c.abs_last + 45 then
-                        do_action(c, '/ma "Absorb-TP" [t]', 3.0, now, true); c.abs_last = now
-                    elseif c.hs[1] and tp >= 350 and not c.buffs.hsamba and now > c.hs_last + 5 then
-                        do_action(c, '/ja "Haste Samba" <me>', 2.0, now, false); c.hs_last = now
-                    elseif (c.bs[1] or c.qs[1]) and tp >= 100 and guaranteed_in_range(cEntIdx, mIdx, 6.0, ent) and now > c.step_last + 12 then
-                        local step = (c.bs[1] and c.qs[1]) and c.next_step or (c.bs[1] and "Box Step" or "Quick Step")
-                        if c.bs[1] and c.qs[1] then c.next_step = (c.next_step == "Box Step") and "Quick Step" or "Box Step" end
-                        do_action(c, string_format('/ja "%s" [t]', step), 2.0, now, false); c.step_last = now
+                    local tp = party:GetMemberTP(pIdx)
+                    local dist = get_yalms(engageTarget, ent)
+                    if (c.bs[1] or c.qs[1]) and tp >= 100 and dist < 6.0 and now > (c.step_last or 0) + 10 then
+                        local step = (c.bs[1] and c.qs[1]) and 
+                                     ((c.next_step == "Box Step") and "Quick Step" or "Box Step")
+                                     or (c.bs[1] and "Box Step" or "Quick Step")
+                        c.next_step = step
+                        c.step_last = now
+                        do_action(c, string_format('/ja "%s" <t>', step), 1.5, now, false)
                     end
                 end
             end
@@ -530,73 +384,63 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 end)
 
 ------------------------------------------------------------
--- UI RENDERING
+-- UI & COMMANDS
 ------------------------------------------------------------
-ashita.events.register('d3d_present', 'render_ui', function ()
+ashita.events.register('d3d_present', 'render_ui', function()
     if not show_ui then return end
-    local now = os_clock()
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, UI_PADDING)
     imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, UI_SPACING)
-
     if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
         if imgui.BeginTable('SyncTable', #ui_columns + 1, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
             imgui.TableSetupColumn('Name', 0, 50)
             for _, col in ipairs(ui_columns) do imgui.TableSetupColumn(col.label, 0, 18) end
             imgui.TableHeadersRow()
-
-            local function draw_row(t, color)
+            
+            local function draw(t, col)
                 imgui.TableNextRow(); imgui.TableNextColumn()
-                local label_color = not t.in_zone and COLOR_OFFLINE
-                    or (t.low_mp_mode and COLOR_RECOVERING
-                    or (now <= t.action_lock and COLOR_BUSY or color))
-                if label_color then imgui.TextColored(label_color, t.disp_name) else imgui.Text(t.disp_name) end
-                for _, col in ipairs(ui_columns) do
+                local c = not t.in_zone and COLOR_OFFLINE 
+                    or (t.low_mp_mode and COLOR_RECOVERING) 
+                    or (os_clock() <= t.action_lock and COLOR_BUSY or col)
+                
+                if c then imgui.TextColored(c, t.disp_name) else imgui.Text(t.disp_name) end
+                for _, v in ipairs(ui_columns) do
                     imgui.TableNextColumn()
-                    local valid = not (t.is_main and not col.allow_main)
-                        and not (col.rdm_only and not t.is_rdm)
-                        and (color ~= COLOR_GUEST or col.key == 'buf')
-                    if valid then imgui.Checkbox(t.ui_ids[col.key], t[col.key]) else imgui.TextDisabled("-") end
+                    if not (t.is_main and not v.allow_main) and not (v.rdm_only and not t.is_rdm) and (col ~= COLOR_GUEST or v.key == 'buf') then
+                        imgui.Checkbox(t.ui_ids[v.key], t[v.key])
+                    else imgui.TextDisabled("-") end
                 end
             end
 
-            for _, c in ipairs(chars) do draw_row(c, nil) end
-            for _, g in ipairs(guests) do draw_row(g, COLOR_GUEST) end
+            for _, c in ipairs(chars) do draw(c, nil) end
+            for _, g in ipairs(guests) do draw(g, COLOR_GUEST) end
             imgui.EndTable()
         end
     end
-    imgui.End(); imgui.PopStyleVar(2)
+    imgui.End()
+    imgui.PopStyleVar(2)
 end)
 
-------------------------------------------------------------
--- COMMANDS & LOAD
-------------------------------------------------------------
 ashita.events.register('command', 'cmd_logic', function(e)
     local args = e.command:args()
     if #args == 0 or args[1]:lower() ~= '/sync' then return end
     e.blocked = true
-
-    if #args == 1 then show_ui = not show_ui; return end
+    if #args == 1 then show_ui = not show_ui return end
     local cmds = { f='f', e='e', deb='deb', buf='buf', b='buf', qs='qs', bs='bs', abs='abs', hs='hs' }
     local arg2, arg3, arg4 = args[2]:lower(), args[3] and args[3]:lower(), args[4] and args[4]:lower()
     local cmd, target_raw, state_raw
-    if cmds[arg2] then
-        cmd, target_raw, state_raw = cmds[arg2], arg3 or 'all', arg4
-    else
-        cmd, target_raw, state_raw = arg3 and cmds[arg3], arg2, arg4
-    end
-
-    if target_raw == 'ui' then show_ui = (state_raw == 'on') or (not state_raw and not show_ui); return end
-
-    local state   = (state_raw == 'on') and true or ((state_raw == 'off') and false or nil)
+    if cmds[arg2] then cmd, target_raw, state_raw = cmds[arg2], arg3 or 'all', arg4
+    else cmd, target_raw, state_raw = arg3 and cmds[arg3], arg2, arg4 end
+    if target_raw == 'ui' then show_ui = (state_raw == 'on') or (not state_raw and not show_ui) return end
+    local state = (state_raw == 'on') and true or ((state_raw == 'off') and false or nil)
     local target = target_raw == 'all' and 'all' or nil
-    if not target then for _, c in ipairs(chars) do if c.name_lower:sub(1, #target_raw) == target_raw then target = c; break end end end
-
+    if not target then 
+        for _, c in ipairs(chars) do if c.name_lower:sub(1,#target_raw) == target_raw then target = c break end end
+        if not target then for _, g in ipairs(guests) do if g.name_lower:sub(1,#target_raw) == target_raw then target = g break end end end
+    end
     if target == 'all' then
         for _, c in ipairs(chars) do if c[cmd] then c[cmd][1] = (state == nil) and (not c[cmd][1]) or state end end
         for _, g in ipairs(guests) do if g[cmd] then g[cmd][1] = (state == nil) and (not g[cmd][1]) or state end end
-    elseif target and target[cmd] then
-        target[cmd][1] = (state == nil) and (not target[cmd][1]) or state
-    end
+    elseif target and target[cmd] then target[cmd][1] = (state == nil) and (not target[cmd][1]) or state end
 end)
 
 ashita.events.register('load', 'sync_load', function()
