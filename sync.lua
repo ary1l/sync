@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.050326_v16.1'
+addon.version = '.050326'
 addon.desc    = 'sync'
 require('common')
 local imgui = require('imgui')
