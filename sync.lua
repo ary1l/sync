@@ -21,7 +21,7 @@ local UI_PADDING    = {2, 2}
 local UI_SPACING    = {2, 2}
 local COLOR_OFFLINE = {1.0, 0.2, 0.2, 1.0}
 local COLOR_BUSY    = {1.0, 0.8, 0.0, 1.0}
-local COLOR_GUEST   = {0.6, 0.9, 1.0, 1.0}
+local COLOR_GUEST    = {0.6, 0.9, 1.0, 1.0}
 local COLOR_RECOVERING = {0.4, 0.6, 1.0, 1.0}
 
 ------------------------------------------------------------
@@ -35,7 +35,7 @@ local BUFF_IDS = {
 }
 
 local JOB_IDS = {
-    WHM = 3, BLM = 4, RDM = 5, PLD = 7, DRK = 8,
+    WHM = 3, BLM = 4, RDM = 5, BRD = 6, PLD = 7, DRK = 8,
     SMN = 15, BLU = 16, GEO = 21, RUN = 22
 }
 
@@ -46,8 +46,9 @@ local silence_whitelist = {
 
 local refresh_jobs = {
     [JOB_IDS.WHM] = true, [JOB_IDS.BLM] = true, [JOB_IDS.RDM] = true,
-    [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, [JOB_IDS.SMN] = true,
-    [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, [JOB_IDS.RUN] = true
+    [JOB_IDS.BRD] = true, [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, 
+    [JOB_IDS.SMN] = true, [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, 
+    [JOB_IDS.RUN] = true
 }
 
 local chars = {
@@ -228,7 +229,7 @@ local function update_membership_and_zones(party)
 end
 
 local function parse_buff(b, buffs)
-    if     b == BUFF_IDS.HASTE       then buffs.h      = true
+    if      b == BUFF_IDS.HASTE       then buffs.h      = true
     elseif b == BUFF_IDS.REFRESH     then buffs.r      = true
     elseif b == BUFF_IDS.PHALANX     then buffs.p      = true
     elseif b == BUFF_IDS.COMPOSURE   then buffs.comp   = true
@@ -294,11 +295,21 @@ end
 
 ------------------------------------------------------------
 -- ALLIANCE CYCLE COMPLETION CHECK
--- Unchecks Bu and resets locks once h/pro/sh have all been cast
+-- Ensures Haste, Protect, Shell, and applicable Phalanx/Refresh are cast
 ------------------------------------------------------------
 local function check_alliance_cycle_done(t, rdm)
     local tl = rdm.buff_locks[t.name]
-    if tl and (tl.h or 0) > 0 and (tl.pro or 0) > 0 and (tl.sh or 0) > 0 then
+    if not tl then return end
+    
+    local rdm_grp = math_floor(rdm.pt_data.index / 6)
+    local t_grp   = math_floor(t.pt_data.index / 6)
+    local same_party = (rdm_grp == t_grp)
+
+    local core_done = (tl.h or 0) > 0 and (tl.pro or 0) > 0 and (tl.sh or 0) > 0
+    local refresh_done = (not same_party or not refresh_jobs[t.pt_data.job] or (tl.r or 0) > 0)
+    local phalanx_done = (not same_party or (tl.p or 0) > 0)
+
+    if core_done and refresh_done and phalanx_done then
         t.buf[1] = false
         rdm.buff_locks[t.name] = { h=0, pro=0, sh=0, p=0, r=0 }
     end
@@ -334,13 +345,18 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         lastScanTick = now
     end
 
-    local selfIdx     = party:GetMemberTargetIndex(0)
-    local mainEngaged = (selfIdx > 0 and ent:GetStatus(selfIdx) == 1)
-    local engageTarget, targetHPP = 0, 0
+    local selfIdx = party:GetMemberTargetIndex(0)
+    
+    -- Track leader/main engagement instead of local window engagement
+    local main_char = nil
+    for _, c in ipairs(chars) do if c.is_main then main_char = c; break end end
+    local main_idx = (main_char and main_char.pt_data) and party:GetMemberTargetIndex(main_char.pt_data.index) or selfIdx
+    local mainEngaged = (main_idx > 0 and ent:GetStatus(main_idx) == 1)
 
-    if selfIdx > 0 then
-        local pt = targ:GetTargetIndex(targ:GetIsSubTargetActive())
-        if pt == 0 then pt = ent:GetTargetedIndex(selfIdx) end
+    local engageTarget, targetHPP = 0, 0
+    if main_idx > 0 then
+        local pt = (main_idx == selfIdx) and targ:GetTargetIndex(targ:GetIsSubTargetActive()) or 0
+        if pt == 0 then pt = ent:GetTargetedIndex(main_idx) end
         if pt > 0 then engageTarget, targetHPP = pt, ent:GetHPPercent(pt) end
     end
 
@@ -349,7 +365,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
 
     if rdm and rdm.in_zone and now > rdm.action_lock then
         local rdmIdx    = rdm.pt_data.index
-        local rdmMP     = party:GetMemberMP(rdmIdx) or 0
+        local rdmMP      = party:GetMemberMP(rdmIdx) or 0
         local rdmEntIdx = party:GetMemberTargetIndex(rdmIdx)
 
         -- MP Hysteresis
@@ -391,7 +407,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 local spell_to_cast, target_name = nil, nil
                 local spell_map = { h="Haste II", pro="Protect V", sh="Shell V", p="Phalanx II", r="Refresh III" }
 
-                -- Ensure rdm's own lock table exists before check_needs may reference it
                 rdm.buff_locks[rdm.name] = rdm.buff_locks[rdm.name] or { h=0, pro=0, sh=0, p=0, r=0 }
 
                 local function check_needs(t, key)
@@ -409,8 +424,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                     rdm.buff_locks[t.name] = rdm.buff_locks[t.name] or { h=0, pro=0, sh=0, p=0, r=0 }
                     local t_locks = rdm.buff_locks[t.name]
 
-                    -- Party members: react immediately to buff drop + retry gap safety
-                    -- Alliance members: same reactive check OR fall back to fixed retimer
                     if t.pt_data.index <= 5 then
                         return (not t.buffs[key]) and (now - t_locks[key] > BUFF_RETRY_GAP)
                     else
@@ -431,8 +444,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 if not spell_to_cast then
                     for _, key in ipairs({'h', 'pro', 'sh', 'p', 'r'}) do
                         local found = false
-
-                        -- Party first (slots 0-5)
                         for _, t in ipairs(chars) do
                             if t.pt_data and t.pt_data.index <= 5 and check_needs(t, key) then
                                 spell_to_cast = spell_map[key]; target_name = t.name
@@ -441,8 +452,6 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                                 found = true; break
                             end
                         end
-
-                        -- Alliance next (slots 6-17)
                         if not found then
                             for _, t in ipairs(chars) do
                                 if t.pt_data and t.pt_data.index > 5 and check_needs(t, key) then
@@ -453,21 +462,16 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                                 end
                             end
                         end
-
-                        -- Guests last
                         if not found then
                             for _, t in ipairs(guests) do
                                 if check_needs(t, key) then
                                     spell_to_cast = spell_map[key]; target_name = t.name
                                     rdm.buff_locks[t.name][key] = now
-                                    if t.pt_data.index > 5 then
-                                        check_alliance_cycle_done(t, rdm)
-                                    end
+                                    if t.pt_data.index > 5 then check_alliance_cycle_done(t, rdm) end
                                     found = true; break
                                 end
                             end
                         end
-
                         if found then break end
                     end
                 end
@@ -583,12 +587,13 @@ ashita.events.register('command', 'cmd_logic', function(e)
 
     if target_raw == 'ui' then show_ui = (state_raw == 'on') or (not state_raw and not show_ui); return end
 
-    local state  = (state_raw == 'on') and true or ((state_raw == 'off') and false or nil)
+    local state   = (state_raw == 'on') and true or ((state_raw == 'off') and false or nil)
     local target = target_raw == 'all' and 'all' or nil
     if not target then for _, c in ipairs(chars) do if c.name_lower:sub(1, #target_raw) == target_raw then target = c; break end end end
 
     if target == 'all' then
         for _, c in ipairs(chars) do if c[cmd] then c[cmd][1] = (state == nil) and (not c[cmd][1]) or state end end
+        for _, g in ipairs(guests) do if g[cmd] then g[cmd][1] = (state == nil) and (not g[cmd][1]) or state end end
     elseif target and target[cmd] then
         target[cmd][1] = (state == nil) and (not target[cmd][1]) or state
     end
