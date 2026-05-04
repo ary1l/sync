@@ -140,25 +140,25 @@ local qcmd = function(cmd, isFollow)
 end
 
 local function init_char_state(c)
-    c.name_lower   = c.name:lower()
-    c.disp_name    = c.name:sub(1,5):upper()
+    c.name_lower    = c.name:lower()
+    c.disp_name     = c.name:sub(1,5):upper()
     c.actual_follow = (c.f and c.f[1] or false)
     c.step, c.done, c.action_lock, c.magic_lock = 1, false, 0, 0
-    c.e_prev       = (c.e and c.e[1] or false)
+    c.e_prev        = (c.e and c.e[1] or false)
     c.lastTarget, c.lastEngageTime = 0, 0
     c.lastDebuffTarget     = 0
     c.lastDebuffTargetName = ""
-	c.debuff_wait = 0
+    c.debuff_wait   = 0
     c.hs_last, c.step_last, c.abs_last, c.deb_last = 0, 0, 0, 0
     c.buffs     = { h=false, r=false, p=false, comp=false, pro=false, sh=false, hsamba=false }
     c.last_cast = { comp=0 }
-    c.buff_locks  = {}
+    c.buff_locks    = {}
     c.engaged, c.in_zone, c.silenced = false, false, false
-    c.pt_data  = nil
-    c.entIdx   = 0
-    c.next_step    = "Box Step"
-    c.low_mp_mode  = false
-    c.ui_ids   = {}
+    c.pt_data   = nil
+    c.entIdx    = 0
+    c.next_step     = "Box Step"
+    c.low_mp_mode   = false
+    c.ui_ids    = {}
     for _, col in ipairs(ui_columns) do
         c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower
     end
@@ -187,9 +187,9 @@ local function update_membership_and_zones(party)
                 local name_l = name:lower()
                 if not current_active[name_l] then current_active[name_l] = {} end
                 local ca = current_active[name_l]
-                ca.index           = i
-                ca.job             = party:GetMemberMainJob(i)
-                ca.sId             = sId
+                ca.index            = i
+                ca.job              = party:GetMemberMainJob(i)
+                ca.sId              = sId
                 ca.active_this_scan = true
             end
         end
@@ -228,12 +228,12 @@ local function update_membership_and_zones(party)
 end
 
 local function parse_buff(b, buffs)
-    if     b == BUFF_IDS.HASTE      then buffs.h      = true
-    elseif b == BUFF_IDS.REFRESH    then buffs.r      = true
-    elseif b == BUFF_IDS.PHALANX    then buffs.p      = true
-    elseif b == BUFF_IDS.COMPOSURE  then buffs.comp   = true
-    elseif b == BUFF_IDS.PROTECT    then buffs.pro    = true
-    elseif b == BUFF_IDS.SHELL      then buffs.sh     = true
+    if     b == BUFF_IDS.HASTE       then buffs.h      = true
+    elseif b == BUFF_IDS.REFRESH     then buffs.r      = true
+    elseif b == BUFF_IDS.PHALANX     then buffs.p      = true
+    elseif b == BUFF_IDS.COMPOSURE   then buffs.comp   = true
+    elseif b == BUFF_IDS.PROTECT     then buffs.pro    = true
+    elseif b == BUFF_IDS.SHELL       then buffs.sh     = true
     elseif b == BUFF_IDS.HASTE_SAMBA then buffs.hsamba = true
     end
 end
@@ -293,6 +293,18 @@ local function do_action(c, cmd, lock_time, current_time, stop_movement)
 end
 
 ------------------------------------------------------------
+-- ALLIANCE CYCLE COMPLETION CHECK
+-- Unchecks Bu and resets locks once h/pro/sh have all been cast
+------------------------------------------------------------
+local function check_alliance_cycle_done(t, rdm)
+    local tl = rdm.buff_locks[t.name]
+    if tl and (tl.h or 0) > 0 and (tl.pro or 0) > 0 and (tl.sh or 0) > 0 then
+        t.buf[1] = false
+        rdm.buff_locks[t.name] = { h=0, pro=0, sh=0, p=0, r=0 }
+    end
+end
+
+------------------------------------------------------------
 -- MAIN LOGIC LOOP
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function ()
@@ -322,7 +334,7 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
         lastScanTick = now
     end
 
-    local selfIdx    = party:GetMemberTargetIndex(0)
+    local selfIdx     = party:GetMemberTargetIndex(0)
     local mainEngaged = (selfIdx > 0 and ent:GetStatus(selfIdx) == 1)
     local engageTarget, targetHPP = 0, 0
 
@@ -385,8 +397,8 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                 local function check_needs(t, key)
                     if not t or not t.in_zone or not t.pt_data or not t.buf[1] then return false end
 
-                    local rdm_grp  = math_floor(rdm.pt_data.index / 6)
-                    local t_grp    = math_floor(t.pt_data.index / 6)
+                    local rdm_grp    = math_floor(rdm.pt_data.index / 6)
+                    local t_grp      = math_floor(t.pt_data.index / 6)
                     local same_party = (rdm_grp == t_grp)
                     local targEntIdx = party:GetMemberTargetIndex(t.pt_data.index)
                     if not (t.is_rdm or guaranteed_in_range(rdmEntIdx, targEntIdx, 21.0, ent)) then return false end
@@ -435,8 +447,8 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                             for _, t in ipairs(chars) do
                                 if t.pt_data and t.pt_data.index > 5 and check_needs(t, key) then
                                     spell_to_cast = spell_map[key]; target_name = t.name
-                                    if key == 'p' and t.is_rdm then spell_to_cast, target_name = "Phalanx", "<me>" end
                                     rdm.buff_locks[t.name][key] = now
+                                    check_alliance_cycle_done(t, rdm)
                                     found = true; break
                                 end
                             end
@@ -448,6 +460,9 @@ ashita.events.register('d3d_present', 'logic_loop', function ()
                                 if check_needs(t, key) then
                                     spell_to_cast = spell_map[key]; target_name = t.name
                                     rdm.buff_locks[t.name][key] = now
+                                    if t.pt_data.index > 5 then
+                                        check_alliance_cycle_done(t, rdm)
+                                    end
                                     found = true; break
                                 end
                             end
@@ -557,9 +572,14 @@ ashita.events.register('command', 'cmd_logic', function(e)
     e.blocked = true
 
     if #args == 1 then show_ui = not show_ui; return end
-    local cmds = { f='f', e='e', deb='deb', buf='buf', qs='qs', bs='bs', abs='abs', hs='hs' }
+    local cmds = { f='f', e='e', deb='deb', buf='buf', b='buf', qs='qs', bs='bs', abs='abs', hs='hs' }
     local arg2, arg3, arg4 = args[2]:lower(), args[3] and args[3]:lower(), args[4] and args[4]:lower()
-    local cmd, target_raw, state_raw = cmds[arg2] and arg2 or arg3, (not cmds[arg2] and arg2 or 'all'), arg4 or (not cmds[arg2] and arg3 or nil)
+    local cmd, target_raw, state_raw
+    if cmds[arg2] then
+        cmd, target_raw, state_raw = cmds[arg2], arg3 or 'all', arg4
+    else
+        cmd, target_raw, state_raw = arg3 and cmds[arg3], arg2, arg4
+    end
 
     if target_raw == 'ui' then show_ui = (state_raw == 'on') or (not state_raw and not show_ui); return end
 
