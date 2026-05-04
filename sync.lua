@@ -62,6 +62,7 @@ local current_active = {}
 local known_cores = {}
 local buff_cache = {}
 local debuff_queue = {}
+local last_engage_target = 0
 
 local cached_rdm = nil
 local cached_main = nil
@@ -87,15 +88,17 @@ local function get_cache(t)
     return buff_cache[id]
 end
 
-local function get_debuff_queue(name)
-    if not name then return {} end
-    if not debuff_queue[name] then
-        debuff_queue[name] = {
-            { name="Silence", done=false }, { name="Dia III", done=false },
-            { name="Frazzle III", done=false }, { name="Distract III", done=false },
+local function get_debuff_queue(targetIdx)
+    if not targetIdx or targetIdx == 0 then return {} end
+    if not debuff_queue[targetIdx] then
+        debuff_queue[targetIdx] = {
+            { name="Silence",      done=false },
+            { name="Dia III",      done=false },
+            { name="Frazzle III",  done=false },
+            { name="Distract III", done=false },
         }
     end
-    return debuff_queue[name]
+    return debuff_queue[targetIdx]
 end
 
 local BUFF_RETIMER = { r=300, h=270, p=270, pro=3300, sh=3300, comp=3600 }
@@ -147,7 +150,7 @@ local function init_char_state(c)
     c.comp_lock = 0
     c.buff_locks = {}
     c.low_mp_mode = false
-    c.actual_follow = nil
+    c.actual_follow = true
     c.buffs = { h=false, r=false, p=false, comp=false, pro=false, sh=false, samba=false }
     c.ui_ids = {}
     for _, col in ipairs(ui_columns) do c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower end
@@ -164,35 +167,52 @@ for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower]=true 
 local function check_needs(t, key, rdmGroup, rdm, now, party, ent)
     if not t or not t.in_zone or not t.pt_data or not t.buf then return false end
     if not t.buf[1] then return false end
-    local cache = get_cache(t)
-    if not cache or not chars[1] or not chars[1].pt_data then return false end
+    if not chars[1] or not chars[1].pt_data then return false end   -- nil guard
 
-    local tIdx = t.pt_data.index
+    local cache = get_cache(t)
+    if not cache then return false end
+
+    local tIdx    = t.pt_data.index
     local leadIdx = chars[1].pt_data.index
     local is_in_lead_party = (math_floor(tIdx / 6) == math_floor(leadIdx / 6))
-    
+
     if is_in_lead_party then
-        if t.buffs and t.buffs[key] then cache[key] = now + BUFF_RETIMER[key] return false end
+        if t.buffs and t.buffs[key] then cache[key] = now + BUFF_RETIMER[key]; return false end
     else
         if cache[key] and now < cache[key] then return false end
     end
 
+    -- alliance members (index 6+) often return tEntIdx=0; skip distance check in that case,
+    -- the server will reject an out-of-range cast and BUFF_RETRY_GAP prevents spam
     local tEntIdx = party:GetMemberTargetIndex(tIdx)
     if tEntIdx > 0 and not (t.is_rdm or get_dist_sq(tEntIdx, ent) < 441.0) then return false end
-    
+
     local in_same_party_as_rdm = (rdmGroup == math_floor(tIdx / 6))
     if key == 'r' and (not in_same_party_as_rdm or not refresh_jobs[t.pt_data.job]) then return false end
     if key == 'p' and not in_same_party_as_rdm then return false end
-    
+
     rdm.buff_locks[t.name] = rdm.buff_locks[t.name] or {}
     if now - (rdm.buff_locks[t.name][key] or 0) < BUFF_RETRY_GAP then return false end
-    
+
     return true
 end
+
 
 ------------------------------------------------------------
 -- SCANNING
 ------------------------------------------------------------
+local function reset_combat_flags()
+    local to_reset = {'e', 'hs', 'bs', 'qs', 'abs', 'deb', 'buf'}
+    for _, c in ipairs(chars) do
+        for _, key in ipairs(to_reset) do if c[key] then c[key][1] = false end end
+        c.actual_follow = true 
+    end
+    for _, g in ipairs(guests) do
+        for _, key in ipairs(to_reset) do if g[key] then g[key][1] = false end end
+        g.actual_follow = nil
+    end
+end
+
 local function update_membership_and_zones(party)
     local my_zone = party:GetMemberZone(0)
     for _, v in pairs(current_active) do v.active_this_scan = false end
@@ -289,11 +309,14 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
     if not player or not party or not ent then return end
 
-    if player:GetIsZoning() ~= 0 then 
-        is_zoning_prev = true return 
-    elseif is_zoning_prev then
-        guests = {}; buff_cache = {}; debuff_queue = {}; is_zoning_prev = false
-    end
+	if player:GetIsZoning() ~= 0 then 
+		is_zoning_prev = true 
+    return  
+	elseif is_zoning_prev then
+    -- Call the reset function here to clear flags for 'chars'
+    reset_combat_flags() 
+    guests = {}; buff_cache = {}; debuff_queue = {}; is_zoning_prev = false
+	end
 
     if now - lastScanTick >= TICK_SCAN then
         update_membership_and_zones(party)
@@ -318,12 +341,21 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         if rdm.low_mp_mode then goto SKIP_RDM_BUFF end
 
         if rdm.deb[1] and engageTarget > 0 and ent:GetHPPercent(engageTarget) > 5 then
-            local tName = ent:GetName(engageTarget)
-            local q = get_debuff_queue(tName and tName:lower() or "")
+            -- reset queue whenever we switch targets
+            if engageTarget ~= last_engage_target then
+                debuff_queue = {}
+                last_engage_target = engageTarget
+            end
+
+            local tName   = ent:GetName(engageTarget) or ""
+            local tNameL  = tName:lower()
+            local q       = get_debuff_queue(engageTarget)
+
             if get_dist_sq(engageTarget, ent) < 441.0 then
                 for _, d in ipairs(q) do
                     if not d.done then
-                        if d.name == "Silence" and not silence_whitelist[tName:lower()] then d.done = true
+                        if d.name == "Silence" and not silence_whitelist[tNameL] then
+                            d.done = true   -- not silenceable, skip and fall through to next
                         else
                             do_action(rdm, string_format('/ma "%s" <t>', d.name), get_cast_delay(d.name), now, true)
                             d.done = true; goto SKIP_RDM_BUFF
@@ -350,14 +382,22 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 end
             else
                 local is_self = (bTarget.name_lower == rdm.name_lower)
-                local spell = "Haste II" 
-                if bKey == 'r' then spell = "Refresh III"
-                elseif bKey == 'p' then spell = is_self and "Phalanx" or "Phalanx II"
+                local spell = "Haste II"
+                if bKey == 'r'   then spell = "Refresh III"
+                elseif bKey == 'p'   then spell = is_self and "Phalanx" or "Phalanx II"
                 elseif bKey == 'pro' then spell = "Protect V"
-                elseif bKey == 'sh' then spell = "Shell V" end
-                rdm.buff_locks[bTarget.name] = rdm.buff_locks[bTarget.name] or {}
+                elseif bKey == 'sh'  then spell = "Shell V" end
+
+                rdm.buff_locks[bTarget.name]       = rdm.buff_locks[bTarget.name] or {}
                 rdm.buff_locks[bTarget.name][bKey] = now
-                if (math_floor(bTarget.pt_data.index / 6) ~= math_floor(chars[1].pt_data.index / 6)) then get_cache(bTarget)[bKey] = now + BUFF_RETIMER[bKey] end
+
+                -- set cache for anyone we can't see buffs on (alliance + guests)
+                local bTargetGroup = math_floor(bTarget.pt_data.index / 6)
+                local leadGroup    = chars[1].pt_data and math_floor(chars[1].pt_data.index / 6) or -1
+                if bTargetGroup ~= leadGroup then
+                    get_cache(bTarget)[bKey] = now + BUFF_RETIMER[bKey]
+                end
+
                 do_action(rdm, string_format('/ma "%s" %s', spell, is_self and "<me>" or bTarget.name), get_cast_delay(spell), now, false)
             end
         end
@@ -372,7 +412,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
             if entIdx > 0 then
                 local is_attacking = (ent:GetStatus(entIdx) == 1)
                 
-                -- [FUNCTIONAL] Follow Logic
+                -- Follow Logic
                 if c.f[1] and c.actual_follow ~= true then
                     qcmd('/mst ' .. c.name .. ' /ms follow ' .. main_char.name, true)
                     c.actual_follow = true
@@ -381,21 +421,20 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                     c.actual_follow = false
                 end
 
-                -- [FUNCTIONAL] Engage Logic
-                if c.e[1] and not is_attacking and engageTarget > 0 then
+                -- Engage Logic
+                if c.e[1] and engageTarget > 0 then
                     do_action(c, '/attack [t]', 1.5, now, false)
                 elseif not c.e[1] and is_attacking then
                     do_action(c, '/attack off', 1.5, now, false)
                 end
 
-                -- [NEW] Absorb TP Logic - Decoupled from combat state
-                -- Triggers if Shaymin has a target and the 30s timer is ready.
+                -- Absorb TP Logic
                 if c.abs[1] and engageTarget > 0 and now > (c.abs_last or 0) + 30 then
                     c.abs_last = now
                     do_action(c, '//absorbtp [t]', 1.5, now, false)
                 end
 
-                -- Combat-only Job Logic
+                -- Combat Job Logic
                 if is_attacking then
                     local tp = party:GetMemberTP(pIdx)
                     local dist_sq = get_dist_sq(engageTarget, ent)
