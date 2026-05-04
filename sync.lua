@@ -1,7 +1,7 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
 addon.version = '.050326_v6'
-addon.desc    = 'full sync fixed syntax'
+addon.desc    = 'full sync'
 
 require('common')
 local imgui = require('imgui')
