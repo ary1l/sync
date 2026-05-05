@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.0636782'
+addon.version = '.050426'
 addon.desc    = 'sync'
 
 require('common')
@@ -432,7 +432,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 for _, d in ipairs(q) do
                     if not d.done then
                         if d.name == "Silence" and not silence_whitelist[tNameL] then
-                            d.done = true   -- not silenceable; fall through to next debuff
+                            d.done = true   -- no silence needed; fall through to next debuff
                         else
                             do_action(rdm, string_format('/ma "%s" [t]', d.name), get_cast_delay(d.name), now, true)
                             d.done = true; goto SKIP_RDM_BUFF
@@ -499,7 +499,11 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                     qcmd('/mst ' .. c.name .. ' /ms follow off', true)
                     c.actual_follow = false
                 end
-
+			                -- Absorb TP Logic
+                if c.abs[1] and now > (c.abs_last or 0) + 30 then
+                    c.abs_last = now
+                    do_action(c, '/ma "Absorb-TP" [t]', 1.5, now, false)
+                end
                 -- Engage Logic
                 if c.e[1] then
                     if main_is_attacking and engageTarget > 0 then
@@ -530,12 +534,6 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                     AshitaCore:GetChatManager():QueueCommand(1, cmd)
                     c.auto_engaged = false
                     c.retry        = nil
-                end
-
-                -- Absorb TP Logic
-                if c.abs[1] and engageTarget > 0 and now > (c.abs_last or 0) + 30 then
-                    c.abs_last = now
-                    do_action(c, '//absorbtp [t]', 1.5, now, false)
                 end
 
                 -- Combat Job Logic
