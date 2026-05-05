@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.050426'
+addon.version = '.0636782'
 addon.desc    = 'sync'
 
 require('common')
@@ -27,6 +27,9 @@ local COLOR_RECOVERING = {0.4, 0.6, 1.0, 1.0}
 -- CONFIGURATION & DICTIONARIES
 ------------------------------------------------------------
 local show_ui = true
+
+local ENGAGE_RETRY_GAP = 0.5
+local RETRY_DELAY      = 0.7
 
 local BUFF_IDS = {
     HASTE = 33, PROTECT = 40, SHELL = 41, REFRESH = 43,
@@ -62,10 +65,11 @@ local current_active = {}
 local known_cores = {}
 local buff_cache = {}
 local debuff_queue = {}
-local last_engage_target = 0
 
-local cached_rdm = nil
+local cached_rdm  = nil
 local cached_main = nil
+
+local last_engage_target = 0
 
 local ui_columns = {
     { label = 'F',  key = 'f',   allow_main = false, rdm_only = false },
@@ -101,10 +105,10 @@ local function get_debuff_queue(targetIdx)
     return debuff_queue[targetIdx]
 end
 
-local BUFF_RETIMER = { r=300, h=270, p=270, pro=3300, sh=3300, comp=3600 }
+local BUFF_RETIMER   = { r=300, h=270, p=270, pro=3300, sh=3300, comp=3600 }
 local BUFF_RETRY_GAP = 9.0
 local RDM_FAST_CAST  = 0.50
-local ANIMATION_LOCK = 2.75 
+local ANIMATION_LOCK = 2.75
 
 local SPELL_CAST_TIMES = {
     ["Refresh III"] = 3.0,   ["Distract III"] = 3.0,
@@ -122,6 +126,53 @@ end
 local function get_dist_sq(entIdx, ent)
     if not entIdx or entIdx == 0 then return 9999 end
     return ent:GetDistance(entIdx) or 9999
+end
+
+------------------------------------------------------------
+-- TARGET HELPERS
+-- Use the target manager for the player's live target — entity memory
+-- (GetTargetedIndex) can be stale or unpopulated for player characters.
+------------------------------------------------------------
+local function get_player_target(targ)
+    if not targ then return 0 end
+    local ok, idx = pcall(function()
+        local isSub = targ:GetIsSubTargetActive()
+        return targ:GetTargetIndex(isSub)
+    end)
+    return (ok and idx and idx > 0) and idx or 0
+end
+
+local function GetTargetOfTarget(targ, ent)
+    if not targ or not ent then return 0 end
+    local ok, targetIndex = pcall(function()
+        local isSub = targ:GetIsSubTargetActive()
+        return targ:GetTargetIndex(isSub)
+    end)
+    if not ok or not targetIndex or targetIndex == 0 then return 0 end
+    local tot = ent:GetTargetedIndex(targetIndex)
+    return (tot and tot > 0) and tot or 0
+end
+
+------------------------------------------------------------
+-- ENGAGE RETRY
+------------------------------------------------------------
+local function queue_retry(c, cmd, now)
+    c.retry = { cmd = cmd, time = now + RETRY_DELAY }
+end
+
+local function process_retry(c, now, party, ent)
+    if not c.retry or now < c.retry.time then return end
+    if c.retry.cmd:find('/attack') then
+        local pIdx = c.pt_data and c.pt_data.index
+        local entIdx = pIdx and party:GetMemberTargetIndex(pIdx) or 0
+        local status = (entIdx > 0) and ent:GetStatus(entIdx) or 0
+        if status ~= 1 then
+            AshitaCore:GetChatManager():QueueCommand(1, c.retry.cmd)
+        end
+    else
+        AshitaCore:GetChatManager():QueueCommand(1, c.retry.cmd)
+    end
+    c.retry = nil
 end
 
 ------------------------------------------------------------
@@ -145,21 +196,27 @@ end
 
 local function init_char_state(c)
     c.name_lower = c.name:lower()
-    c.disp_name = c.name:sub(1,5):upper()
-    c.action_lock = 0
-    c.comp_lock = 0
-    c.buff_locks = {}
-    c.low_mp_mode = false
+    c.disp_name  = c.name:sub(1,5):upper()
+    c.action_lock  = 0
+    c.comp_lock    = 0
+    c.buff_locks   = {}
+    c.low_mp_mode  = false
     c.actual_follow = true
     c.buffs = { h=false, r=false, p=false, comp=false, pro=false, sh=false, samba=false }
     c.ui_ids = {}
-    for _, col in ipairs(ui_columns) do c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower end
-    
-    if c.is_rdm then cached_rdm = c end
+    -- engage tracking
+    c.last_engage_target = 0
+    c.last_engage_time   = 0
+    c.auto_engaged       = false
+    c.retry              = nil
+    for _, col in ipairs(ui_columns) do
+        c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower
+    end
+    if c.is_rdm  then cached_rdm  = c end
     if c.is_main then cached_main = c end
 end
 
-for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower]=true end
+for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower] = true end
 
 ------------------------------------------------------------
 -- RDM HELPER FUNCTIONS
@@ -167,10 +224,8 @@ for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower]=true 
 local function check_needs(t, key, rdmGroup, rdm, now, party, ent)
     if not t or not t.in_zone or not t.pt_data or not t.buf then return false end
     if not t.buf[1] then return false end
-    if not chars[1] or not chars[1].pt_data then return false end   -- nil guard
-
     local cache = get_cache(t)
-    if not cache then return false end
+    if not cache or not chars[1] or not chars[1].pt_data then return false end
 
     local tIdx    = t.pt_data.index
     local leadIdx = chars[1].pt_data.index
@@ -182,8 +237,7 @@ local function check_needs(t, key, rdmGroup, rdm, now, party, ent)
         if cache[key] and now < cache[key] then return false end
     end
 
-    -- alliance members (index 6+) often return tEntIdx=0; skip distance check in that case,
-    -- the server will reject an out-of-range cast and BUFF_RETRY_GAP prevents spam
+    -- alliance members (index 6+) often return tEntIdx=0; skip distance check in that case
     local tEntIdx = party:GetMemberTargetIndex(tIdx)
     if tEntIdx > 0 and not (t.is_rdm or get_dist_sq(tEntIdx, ent) < 441.0) then return false end
 
@@ -197,7 +251,6 @@ local function check_needs(t, key, rdmGroup, rdm, now, party, ent)
     return true
 end
 
-
 ------------------------------------------------------------
 -- SCANNING
 ------------------------------------------------------------
@@ -205,11 +258,19 @@ local function reset_combat_flags()
     local to_reset = {'e', 'hs', 'bs', 'qs', 'abs', 'deb', 'buf'}
     for _, c in ipairs(chars) do
         for _, key in ipairs(to_reset) do if c[key] then c[key][1] = false end end
-        c.actual_follow = true 
+        c.actual_follow      = true
+        c.last_engage_target = 0
+        c.last_engage_time   = 0
+        c.auto_engaged       = false
+        c.retry              = nil
     end
     for _, g in ipairs(guests) do
         for _, key in ipairs(to_reset) do if g[key] then g[key][1] = false end end
-        g.actual_follow = nil
+        g.actual_follow      = nil
+        g.last_engage_target = 0
+        g.last_engage_time   = 0
+        g.auto_engaged       = false
+        g.retry              = nil
     end
 end
 
@@ -235,7 +296,7 @@ local function update_membership_and_zones(party)
     end
     for nl, data in pairs(current_active) do
         local known = known_cores[nl]
-        if not known then for _, g in ipairs(guests) do if g.name_lower == nl then known = true break end end end
+        if not known then for _, g in ipairs(guests) do if g.name_lower == nl then known = true; break end end end
         if not known then
             local g = { name = party:GetMemberName(data.index), buf = {false} }
             init_char_state(g); g.in_zone, g.pt_data = true, data
@@ -253,35 +314,35 @@ local function scan_buffs(t, party, player)
 
     for _, c in ipairs(t) do
         if not c.in_zone then goto skip end
-        c.buffs.h = false; c.buffs.r = false; c.buffs.p = false; 
+        c.buffs.h = false; c.buffs.r = false; c.buffs.p = false
         c.buffs.comp = false; c.buffs.pro = false; c.buffs.sh = false; c.buffs.samba = false
         if c.name_lower == myNameL then
             local b = player:GetBuffs()
-            for i=0,31 do
+            for i = 0, 31 do
                 local id = b[i]
-                if id == BUFF_IDS.HASTE then c.buffs.h=true
-                elseif id == BUFF_IDS.REFRESH then c.buffs.r=true
-                elseif id == BUFF_IDS.PHALANX then c.buffs.p=true
-                elseif id == BUFF_IDS.COMPOSURE then c.buffs.comp=true
-                elseif id == BUFF_IDS.PROTECT then c.buffs.pro=true
-                elseif id == BUFF_IDS.SHELL then c.buffs.sh=true
-                elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.samba=true end
+                if     id == BUFF_IDS.HASTE      then c.buffs.h    = true
+                elseif id == BUFF_IDS.REFRESH     then c.buffs.r    = true
+                elseif id == BUFF_IDS.PHALANX     then c.buffs.p    = true
+                elseif id == BUFF_IDS.COMPOSURE   then c.buffs.comp = true
+                elseif id == BUFF_IDS.PROTECT     then c.buffs.pro  = true
+                elseif id == BUFF_IDS.SHELL       then c.buffs.sh   = true
+                elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.samba= true end
             end
         elseif c.pt_data and c.pt_data.index <= 5 then
-            for slot=0,5 do
+            for slot = 0, 5 do
                 local m = buff_ptr + (0x30 * slot)
                 if ashita.memory.read_uint32(m) == c.pt_data.sId then
-                    for j=0,31 do
+                    for j = 0, 31 do
                         local low = ashita.memory.read_uint8(m + 16 + j)
                         if low == 255 then break end
                         local id = (bit_lshift(bit_band(bit_rshift(ashita.memory.read_uint8(m + 8 + math_floor(j/4)), (j%4)*2), 0x03), 8)) + low
-                        if id == BUFF_IDS.HASTE then c.buffs.h=true
-                        elseif id == BUFF_IDS.REFRESH then c.buffs.r=true
-                        elseif id == BUFF_IDS.PHALANX then c.buffs.p=true
-                        elseif id == BUFF_IDS.COMPOSURE then c.buffs.comp=true
-                        elseif id == BUFF_IDS.PROTECT then c.buffs.pro=true
-                        elseif id == BUFF_IDS.SHELL then c.buffs.sh=true
-                        elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.samba=true end
+                        if     id == BUFF_IDS.HASTE      then c.buffs.h    = true
+                        elseif id == BUFF_IDS.REFRESH     then c.buffs.r    = true
+                        elseif id == BUFF_IDS.PHALANX     then c.buffs.p    = true
+                        elseif id == BUFF_IDS.COMPOSURE   then c.buffs.comp = true
+                        elseif id == BUFF_IDS.PROTECT     then c.buffs.pro  = true
+                        elseif id == BUFF_IDS.SHELL       then c.buffs.sh   = true
+                        elseif id == BUFF_IDS.HASTE_SAMBA then c.buffs.samba= true end
                     end
                     break
                 end
@@ -309,14 +370,15 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
     if not player or not party or not ent then return end
 
-	if player:GetIsZoning() ~= 0 then 
-		is_zoning_prev = true 
-    return  
-	elseif is_zoning_prev then
-    -- Call the reset function here to clear flags for 'chars'
-    reset_combat_flags() 
-    guests = {}; buff_cache = {}; debuff_queue = {}; is_zoning_prev = false
-	end
+    if player:GetIsZoning() ~= 0 then
+        is_zoning_prev = true
+        return
+    elseif is_zoning_prev then
+        reset_combat_flags()
+        guests = {}; buff_cache = {}; debuff_queue = {}
+        last_engage_target = 0
+        is_zoning_prev = false
+    end
 
     if now - lastScanTick >= TICK_SCAN then
         update_membership_and_zones(party)
@@ -324,40 +386,55 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         lastScanTick = now
     end
 
-    local rdm = cached_rdm
+    local rdm       = cached_rdm
     local main_char = cached_main
-    local main_idx = (main_char and main_char.pt_data) and party:GetMemberTargetIndex(main_char.pt_data.index) or party:GetMemberTargetIndex(0)
-    local engageTarget = (main_idx > 0 and ent:GetStatus(main_idx) == 1) and ent:GetTargetedIndex(main_idx) or 0
+    local main_idx  = (main_char and main_char.pt_data)
+                      and party:GetMemberTargetIndex(main_char.pt_data.index)
+                      or  party:GetMemberTargetIndex(0)
+
+    local main_is_attacking = (main_idx > 0 and ent:GetStatus(main_idx) == 1)
+
+    -- Read player's live target from the TARGET MANAGER (not entity memory — entity
+    -- GetTargetedIndex can be stale/zero for player characters and is unreliable here).
+    -- Fall back to target-of-target if the primary read returns nothing.
+    local targ = mm:GetTarget()
+    local engageTarget = 0
+    if main_is_attacking then
+        engageTarget = get_player_target(targ)
+        if engageTarget == 0 then
+            engageTarget = GetTargetOfTarget(targ, ent)
+        end
+    end
+
+    -- Reset debuff queue on target change
+    if engageTarget ~= last_engage_target then
+        debuff_queue = {}
+        last_engage_target = engageTarget
+    end
 
     ------------------------------------------------------------
     -- RDM LOGIC
     ------------------------------------------------------------
     if rdm and rdm.in_zone and now > rdm.action_lock then
-        local rdmIdx = rdm.pt_data.index
-        local rdmMP = party:GetMemberMP(rdmIdx) or 0
+        local rdmIdx   = rdm.pt_data.index
+        local rdmMP    = party:GetMemberMP(rdmIdx) or 0
         local rdmGroup = math_floor(rdmIdx / 6)
 
         if rdmMP < 200 then rdm.low_mp_mode = true elseif rdmMP >= 450 then rdm.low_mp_mode = false end
         if rdm.low_mp_mode then goto SKIP_RDM_BUFF end
 
         if rdm.deb[1] and engageTarget > 0 and ent:GetHPPercent(engageTarget) > 5 then
-            -- reset queue whenever we switch targets
-            if engageTarget ~= last_engage_target then
-                debuff_queue = {}
-                last_engage_target = engageTarget
-            end
-
-            local tName   = ent:GetName(engageTarget) or ""
-            local tNameL  = tName:lower()
-            local q       = get_debuff_queue(engageTarget)
+            local tName  = ent:GetName(engageTarget) or ""
+            local tNameL = tName:lower()
+            local q      = get_debuff_queue(engageTarget)
 
             if get_dist_sq(engageTarget, ent) < 441.0 then
                 for _, d in ipairs(q) do
                     if not d.done then
                         if d.name == "Silence" and not silence_whitelist[tNameL] then
-                            d.done = true   -- not silenceable, skip and fall through to next
+                            d.done = true   -- not silenceable; fall through to next debuff
                         else
-                            do_action(rdm, string_format('/ma "%s" <t>', d.name), get_cast_delay(d.name), now, true)
+                            do_action(rdm, string_format('/ma "%s" [t]', d.name), get_cast_delay(d.name), now, true)
                             d.done = true; goto SKIP_RDM_BUFF
                         end
                     end
@@ -367,8 +444,8 @@ ashita.events.register('d3d_present', 'logic_loop', function()
 
         local bKey, bTarget = nil, nil
         for _, key in ipairs(BUFF_PRIORITY) do
-            for _, t in ipairs(chars) do if check_needs(t, key, rdmGroup, rdm, now, party, ent) then bKey, bTarget = key, t goto found end end
-            for _, g in ipairs(guests) do if check_needs(g, key, rdmGroup, rdm, now, party, ent) then bKey, bTarget = key, g goto found end end
+            for _, t in ipairs(chars)  do if check_needs(t, key, rdmGroup, rdm, now, party, ent) then bKey, bTarget = key, t; goto found end end
+            for _, g in ipairs(guests) do if check_needs(g, key, rdmGroup, rdm, now, party, ent) then bKey, bTarget = key, g; goto found end end
         end
         ::found::
 
@@ -383,7 +460,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
             else
                 local is_self = (bTarget.name_lower == rdm.name_lower)
                 local spell = "Haste II"
-                if bKey == 'r'   then spell = "Refresh III"
+                if     bKey == 'r'   then spell = "Refresh III"
                 elseif bKey == 'p'   then spell = is_self and "Phalanx" or "Phalanx II"
                 elseif bKey == 'pro' then spell = "Protect V"
                 elseif bKey == 'sh'  then spell = "Shell V" end
@@ -404,14 +481,16 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     end
     ::SKIP_RDM_BUFF::
 
-    -- Character Logic
+    ------------------------------------------------------------
+    -- CHARACTER LOGIC
+    ------------------------------------------------------------
     for _, c in ipairs(chars) do
         if not c.is_main and c.in_zone and now > c.action_lock then
-            local pIdx = c.pt_data.index
+            local pIdx   = c.pt_data.index
             local entIdx = party:GetMemberTargetIndex(pIdx)
             if entIdx > 0 then
                 local is_attacking = (ent:GetStatus(entIdx) == 1)
-                
+
                 -- Follow Logic
                 if c.f[1] and c.actual_follow ~= true then
                     qcmd('/mst ' .. c.name .. ' /ms follow ' .. main_char.name, true)
@@ -422,10 +501,35 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 end
 
                 -- Engage Logic
-                if c.e[1] and engageTarget > 0 then
-                    do_action(c, '/attack [t]', 1.5, now, false)
-                elseif not c.e[1] and is_attacking then
-                    do_action(c, '/attack off', 1.5, now, false)
+                if c.e[1] then
+                    if main_is_attacking and engageTarget > 0 then
+                        local time_since = now - (c.last_engage_time or 0)
+                        if (c.last_engage_target ~= engageTarget or not is_attacking)
+                            and time_since >= ENGAGE_RETRY_GAP then
+                            local cmd = '/mst ' .. c.name .. ' /attack [t]'
+                            AshitaCore:GetChatManager():QueueCommand(1, cmd)
+                            queue_retry(c, cmd, now)
+                            c.last_engage_target = engageTarget
+                            c.auto_engaged       = true
+                            c.last_engage_time   = now
+                        end
+                    elseif not main_is_attacking and c.auto_engaged then
+                        -- main stopped fighting, auto-disengage
+                        if is_attacking then
+                            local cmd = '/mst ' .. c.name .. ' /attack off'
+                            AshitaCore:GetChatManager():QueueCommand(1, cmd)
+                        end
+                        c.last_engage_target = 0
+                        c.auto_engaged       = false
+                        c.last_engage_time   = 0
+                        c.retry              = nil
+                    end
+                elseif is_attacking then
+                    -- engage checkbox turned off mid-fight
+                    local cmd = '/mst ' .. c.name .. ' /attack off'
+                    AshitaCore:GetChatManager():QueueCommand(1, cmd)
+                    c.auto_engaged = false
+                    c.retry        = nil
                 end
 
                 -- Absorb TP Logic
@@ -436,21 +540,26 @@ ashita.events.register('d3d_present', 'logic_loop', function()
 
                 -- Combat Job Logic
                 if is_attacking then
-                    local tp = party:GetMemberTP(pIdx)
+                    local tp      = party:GetMemberTP(pIdx)
                     local dist_sq = get_dist_sq(engageTarget, ent)
-                    
-                    -- Haste Samba Logic
+
+                    -- Haste Samba
                     if c.hs[1] and tp >= 350 and not c.buffs.samba then
                         do_action(c, '/ja "Haste Samba" <me>', 1.5, now, false)
                     end
 
-                    -- Step Logic
+                    -- Steps
                     if (c.bs[1] or c.qs[1]) and tp >= 100 and dist_sq < 36.0 and now > (c.step_last or 0) + 10 then
-                        local s = (c.bs[1] and c.qs[1]) and (c.next_step == "Box Step" and "Quick Step" or "Box Step") or (c.bs[1] and "Box Step" or "Quick Step")
+                        local s = (c.bs[1] and c.qs[1])
+                            and (c.next_step == "Box Step" and "Quick Step" or "Box Step")
+                            or  (c.bs[1] and "Box Step" or "Quick Step")
                         c.next_step, c.step_last = s, now
                         do_action(c, string_format('/ja "%s" <t>', s), 1.5, now, false)
                     end
                 end
+
+                -- Retry pending engage command if char still hasn't attacked
+                process_retry(c, now, party, ent)
             end
         end
     end
@@ -465,20 +574,25 @@ ashita.events.register('d3d_present', 'render_ui', function()
     imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, UI_SPACING)
     if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
         if imgui.BeginTable('SyncTable', #ui_columns + 1, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
-            imgui.TableSetupColumn('Name', 0, 50); for _, col in ipairs(ui_columns) do imgui.TableSetupColumn(col.label, 0, 18) end
+            imgui.TableSetupColumn('Name', 0, 50)
+            for _, col in ipairs(ui_columns) do imgui.TableSetupColumn(col.label, 0, 18) end
             imgui.TableHeadersRow()
             local function draw(t, col)
                 imgui.TableNextRow(); imgui.TableNextColumn()
-                local c = not t.in_zone and COLOR_OFFLINE or (t.low_mp_mode and COLOR_RECOVERING) or (os_clock() <= t.action_lock and COLOR_BUSY or col)
+                local c = not t.in_zone and COLOR_OFFLINE
+                    or (t.low_mp_mode and COLOR_RECOVERING)
+                    or (os_clock() <= t.action_lock and COLOR_BUSY or col)
                 if c then imgui.TextColored(c, t.disp_name) else imgui.Text(t.disp_name) end
                 for _, v in ipairs(ui_columns) do
                     imgui.TableNextColumn()
-                    if not (t.is_main and not v.allow_main) and not (v.rdm_only and not t.is_rdm) and (col ~= COLOR_GUEST or v.key == 'buf') then
+                    if not (t.is_main and not v.allow_main)
+                    and not (v.rdm_only and not t.is_rdm)
+                    and (col ~= COLOR_GUEST or v.key == 'buf') then
                         imgui.Checkbox(t.ui_ids[v.key], t[v.key])
                     else imgui.TextDisabled("-") end
                 end
             end
-            for _, c in ipairs(chars) do draw(c, nil) end
+            for _, c in ipairs(chars)  do draw(c, nil) end
             for _, g in ipairs(guests) do draw(g, COLOR_GUEST) end
             imgui.EndTable()
         end
@@ -490,22 +604,26 @@ ashita.events.register('command', 'cmd_logic', function(e)
     local args = e.command:args()
     if #args == 0 or args[1]:lower() ~= '/sync' then return end
     e.blocked = true
-    if #args == 1 then show_ui = not show_ui return end
-    local cmds = { f='f', e='e', deb='deb', buf='buf', b='buf', qs='qs', bs='bs', abs='abs', hs='hs' }
+    if #args == 1 then show_ui = not show_ui; return end
+    local cmds = { f='f', e='e', d='deb', buf='buf', b='buf', qs='qs', bs='bs', abs='abs', hs='hs' }
     local a2, a3, a4 = args[2]:lower(), args[3] and args[3]:lower(), args[4] and args[4]:lower()
     local cmd, tr, st
     if cmds[a2] then cmd, tr, st = cmds[a2], a3 or 'all', a4 else cmd, tr, st = a3 and cmds[a3], a2, a4 end
-    if tr == 'ui' then show_ui = (st == 'on') or (not st and not show_ui) return end
-    local state = (st == 'on') and true or ((st == 'off') and false or nil)
+    if tr == 'ui' then show_ui = (st == 'on') or (not st and not show_ui); return end
+    local state  = (st == 'on') and true or ((st == 'off') and false or nil)
     local target = tr == 'all' and 'all' or nil
     if not target then
-        for _, c in ipairs(chars) do if c.name_lower:sub(1,#tr) == tr then target = c break end end
-        if not target then for _, g in ipairs(guests) do if g.name_lower:sub(1,#tr) == tr then target = g break end end end
+        for _, c in ipairs(chars)  do if c.name_lower:sub(1,#tr) == tr then target = c; break end end
+        if not target then
+            for _, g in ipairs(guests) do if g.name_lower:sub(1,#tr) == tr then target = g; break end end
+        end
     end
     if target == 'all' then
-        for _, c in ipairs(chars) do if c[cmd] then c[cmd][1] = (state == nil) and (not c[cmd][1]) or state end end
+        for _, c in ipairs(chars)  do if c[cmd] then c[cmd][1] = (state == nil) and (not c[cmd][1]) or state end end
         for _, g in ipairs(guests) do if g[cmd] then g[cmd][1] = (state == nil) and (not g[cmd][1]) or state end end
-    elseif target and target[cmd] then target[cmd][1] = (state == nil) and (not target[cmd][1]) or state end
+    elseif target and target[cmd] then
+        target[cmd][1] = (state == nil) and (not target[cmd][1]) or state
+    end
 end)
 
 ashita.events.register('load', 'sync_load', function()
