@@ -4,6 +4,7 @@ addon.version = '.050426'
 addon.desc    = 'sync'
 
 require('common')
+local mm = AshitaCore:GetMemoryManager()
 local imgui = require('imgui')
 
 ------------------------------------------------------------
@@ -179,7 +180,6 @@ end
 -- STATE UTILS
 ------------------------------------------------------------
 local qcmd = function(cmd, isFollow)
-    local mm = AshitaCore:GetMemoryManager()
     local player = mm:GetPlayer()
     if not isFollow and player and player:GetIsZoning() ~= 0 then return end
     AshitaCore:GetChatManager():QueueCommand(1, cmd)
@@ -365,9 +365,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     if now - lastTick < TICK_ACTION then return end
     lastTick = now
 
-    local mm = AshitaCore:GetMemoryManager()
-    if not mm then return end
-    local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
+	local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
     if not player or not party or not ent then return end
 
     if player:GetIsZoning() ~= 0 then
@@ -502,7 +500,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
 			                -- Absorb TP Logic
                 if c.abs[1] and now > (c.abs_last or 0) + 30 then
                     c.abs_last = now
-                    do_action(c, '/ma "Absorb-TP" [t]', 1.5, now, false)
+                    do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now, false)
                 end
                 -- Engage Logic
                 if c.e[1] then
@@ -566,6 +564,22 @@ end)
 ------------------------------------------------------------
 -- UI & COMMANDS
 ------------------------------------------------------------
+local function draw(t, col)
+    imgui.TableNextRow(); imgui.TableNextColumn()
+    local c = not t.in_zone and COLOR_OFFLINE
+        or (t.low_mp_mode and COLOR_RECOVERING)
+        or (os_clock() <= t.action_lock and COLOR_BUSY or col)
+    if c then imgui.TextColored(c, t.disp_name) else imgui.Text(t.disp_name) end
+    for _, v in ipairs(ui_columns) do
+        imgui.TableNextColumn()
+        if not (t.is_main and not v.allow_main)
+        and not (v.rdm_only and not t.is_rdm)
+        and (col ~= COLOR_GUEST or v.key == 'buf') then
+            imgui.Checkbox(t.ui_ids[v.key], t[v.key])
+        else imgui.TextDisabled("-") end
+    end
+end
+
 ashita.events.register('d3d_present', 'render_ui', function()
     if not show_ui then return end
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, UI_PADDING)
@@ -575,21 +589,6 @@ ashita.events.register('d3d_present', 'render_ui', function()
             imgui.TableSetupColumn('Name', 0, 50)
             for _, col in ipairs(ui_columns) do imgui.TableSetupColumn(col.label, 0, 18) end
             imgui.TableHeadersRow()
-            local function draw(t, col)
-                imgui.TableNextRow(); imgui.TableNextColumn()
-                local c = not t.in_zone and COLOR_OFFLINE
-                    or (t.low_mp_mode and COLOR_RECOVERING)
-                    or (os_clock() <= t.action_lock and COLOR_BUSY or col)
-                if c then imgui.TextColored(c, t.disp_name) else imgui.Text(t.disp_name) end
-                for _, v in ipairs(ui_columns) do
-                    imgui.TableNextColumn()
-                    if not (t.is_main and not v.allow_main)
-                    and not (v.rdm_only and not t.is_rdm)
-                    and (col ~= COLOR_GUEST or v.key == 'buf') then
-                        imgui.Checkbox(t.ui_ids[v.key], t[v.key])
-                    else imgui.TextDisabled("-") end
-                end
-            end
             for _, c in ipairs(chars)  do draw(c, nil) end
             for _, g in ipairs(guests) do draw(g, COLOR_GUEST) end
             imgui.EndTable()
