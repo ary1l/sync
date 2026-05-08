@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.050426'
+addon.version = '.050526'
 addon.desc    = 'sync'
 
 require('common')
@@ -21,7 +21,7 @@ local UI_PADDING    = {2, 2}
 local UI_SPACING    = {2, 2}
 local COLOR_OFFLINE = {1.0, 0.2, 0.2, 1.0}
 local COLOR_BUSY    = {1.0, 0.8, 0.0, 1.0}
-local COLOR_GUEST    = {0.6, 0.9, 1.0, 1.0}
+local COLOR_GUEST   = {0.6, 0.9, 1.0, 1.0}
 local COLOR_RECOVERING = {0.4, 0.6, 1.0, 1.0}
 
 ------------------------------------------------------------
@@ -49,7 +49,7 @@ local silence_whitelist = {
 
 local refresh_jobs = {
     [JOB_IDS.WHM] = true, [JOB_IDS.BLM] = true, [JOB_IDS.RDM] = true,
-    [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, [JOB_IDS.SMN] = true, 
+    [JOB_IDS.PLD] = true, [JOB_IDS.DRK] = true, [JOB_IDS.SMN] = true,
     [JOB_IDS.BLU] = true, [JOB_IDS.GEO] = true, [JOB_IDS.RUN] = true
 }
 
@@ -185,11 +185,7 @@ local qcmd = function(cmd, isFollow)
     AshitaCore:GetChatManager():QueueCommand(1, cmd)
 end
 
-local function do_action(c, cmd, lock_time, current_time, stop_movement)
-    if stop_movement and c.f[1] and c.actual_follow ~= false then
-        qcmd('/mst ' .. c.name .. ' /ms follow off', true)
-        c.actual_follow = false
-    end
+local function do_action(c, cmd, lock_time, current_time)
     qcmd('/mst ' .. c.name .. ' ' .. cmd)
     c.action_lock = current_time + lock_time
 end
@@ -365,7 +361,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     if now - lastTick < TICK_ACTION then return end
     lastTick = now
 
-	local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
+    local player, party, ent = mm:GetPlayer(), mm:GetParty(), mm:GetEntity()
     if not player or not party or not ent then return end
 
     if player:GetIsZoning() ~= 0 then
@@ -430,9 +426,9 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 for _, d in ipairs(q) do
                     if not d.done then
                         if d.name == "Silence" and not silence_whitelist[tNameL] then
-                            d.done = true   -- no silence needed; fall through to next debuff
+                            d.done = true   -- not silenceable; fall through to next debuff
                         else
-                            do_action(rdm, string_format('/ma "%s" [t]', d.name), get_cast_delay(d.name), now, true)
+                            do_action(rdm, string_format('/ma "%s" [t]', d.name), get_cast_delay(d.name), now)
                             d.done = true; goto SKIP_RDM_BUFF
                         end
                     end
@@ -453,7 +449,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
             if not composure_active then
                 if now > (rdm.comp_lock or 0) then
                     rdm.comp_lock = now + 5.0; rdmCache.comp = now + 3600
-                    do_action(rdm, '/ja "Composure" <me>', 1.5, now, false)
+                    do_action(rdm, '/ja "Composure" <me>', 1.5, now)
                 end
             else
                 local is_self = (bTarget.name_lower == rdm.name_lower)
@@ -473,7 +469,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                     get_cache(bTarget)[bKey] = now + BUFF_RETIMER[bKey]
                 end
 
-                do_action(rdm, string_format('/ma "%s" %s', spell, is_self and "<me>" or bTarget.name), get_cast_delay(spell), now, false)
+                do_action(rdm, string_format('/ma "%s" %s', spell, is_self and "<me>" or bTarget.name), get_cast_delay(spell), now)
             end
         end
     end
@@ -497,11 +493,13 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                     qcmd('/mst ' .. c.name .. ' /ms follow off', true)
                     c.actual_follow = false
                 end
-			                -- Absorb TP Logic
+
+                -- Absorb TP Logic
                 if c.abs[1] and now > (c.abs_last or 0) + 30 then
                     c.abs_last = now
-                    do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now, false)
+                    do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now)
                 end
+
                 -- Engage Logic
                 if c.e[1] then
                     if main_is_attacking and engageTarget > 0 then
@@ -541,7 +539,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
 
                     -- Haste Samba
                     if c.hs[1] and tp >= 350 and not c.buffs.samba then
-                        do_action(c, '/ja "Haste Samba" <me>', 1.5, now, false)
+                        do_action(c, '/ja "Haste Samba" <me>', 1.5, now)
                     end
 
                     -- Steps
@@ -550,7 +548,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                             and (c.next_step == "Box Step" and "Quick Step" or "Box Step")
                             or  (c.bs[1] and "Box Step" or "Quick Step")
                         c.next_step, c.step_last = s, now
-                        do_action(c, string_format('/ja "%s" <t>', s), 1.5, now, false)
+                        do_action(c, string_format('/ja "%s" <t>', s), 1.5, now)
                     end
                 end
 
