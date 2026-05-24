@@ -1,6 +1,6 @@
 addon.name    = 'sync'
 addon.author  = 'aryl'
-addon.version = '.050526'
+addon.version = '.050526b'
 addon.desc    = 'sync'
 
 require('common')
@@ -58,6 +58,7 @@ local chars = {
     { name='goomy',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='muunch',                  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
     { name='slowpoke',                f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
+    { name='dreepy',                  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false} },
 }
 
 local BUFF_PRIORITY = {"h","r","pro","sh","p"}
@@ -129,11 +130,6 @@ local function get_dist_sq(entIdx, ent)
     return ent:GetDistance(entIdx) or 9999
 end
 
-------------------------------------------------------------
--- TARGET HELPERS
--- Use the target manager for the player's live target — entity memory
--- (GetTargetedIndex) can be stale or unpopulated for player characters.
-------------------------------------------------------------
 local function get_player_target(targ)
     if not targ then return 0 end
     local ok, idx = pcall(function()
@@ -197,14 +193,14 @@ local function init_char_state(c)
     c.comp_lock    = 0
     c.buff_locks   = {}
     c.low_mp_mode  = false
-    c.actual_follow = true
+    c.actual_follow = nil  -- nil forces follow sync on first tick
     c.buffs = { h=false, r=false, p=false, comp=false, pro=false, sh=false, samba=false }
     c.ui_ids = {}
-    -- engage tracking
     c.last_engage_target = 0
     c.last_engage_time   = 0
     c.auto_engaged       = false
     c.retry              = nil
+    c.debuff_wait        = 0
     for _, col in ipairs(ui_columns) do
         c.ui_ids[col.key] = '##' .. col.label .. '_' .. c.name_lower
     end
@@ -233,7 +229,6 @@ local function check_needs(t, key, rdmGroup, rdm, now, party, ent)
         if cache[key] and now < cache[key] then return false end
     end
 
-    -- alliance members (index 6+) often return tEntIdx=0; skip distance check in that case
     local tEntIdx = party:GetMemberTargetIndex(tIdx)
     if tEntIdx > 0 and not (t.is_rdm or get_dist_sq(tEntIdx, ent) < 441.0) then return false end
 
@@ -254,7 +249,7 @@ local function reset_combat_flags()
     local to_reset = {'e', 'hs', 'bs', 'qs', 'abs', 'deb', 'buf'}
     for _, c in ipairs(chars) do
         for _, key in ipairs(to_reset) do if c[key] then c[key][1] = false end end
-        c.actual_follow      = true
+        c.actual_follow      = nil  -- force re-sync on next tick after zone
         c.last_engage_target = 0
         c.last_engage_time   = 0
         c.auto_engaged       = false
@@ -388,9 +383,6 @@ ashita.events.register('d3d_present', 'logic_loop', function()
 
     local main_is_attacking = (main_idx > 0 and ent:GetStatus(main_idx) == 1)
 
-    -- Read player's live target from the TARGET MANAGER (not entity memory — entity
-    -- GetTargetedIndex can be stale/zero for player characters and is unreliable here).
-    -- Fall back to target-of-target if the primary read returns nothing.
     local targ = mm:GetTarget()
     local engageTarget = 0
     if main_is_attacking then
@@ -400,7 +392,6 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         end
     end
 
-    -- Reset debuff queue on target change
     if engageTarget ~= last_engage_target then
         debuff_queue = {}
         last_engage_target = engageTarget
@@ -426,7 +417,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 for _, d in ipairs(q) do
                     if not d.done then
                         if d.name == "Silence" and not silence_whitelist[tNameL] then
-                            d.done = true   -- not silenceable; fall through to next debuff
+                            d.done = true
                         else
                             do_action(rdm, string_format('/ma "%s" [t]', d.name), get_cast_delay(d.name), now)
                             d.done = true; goto SKIP_RDM_BUFF
@@ -462,7 +453,6 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 rdm.buff_locks[bTarget.name]       = rdm.buff_locks[bTarget.name] or {}
                 rdm.buff_locks[bTarget.name][bKey] = now
 
-                -- set cache for anyone we can't see buffs on (alliance + guests)
                 local bTargetGroup = math_floor(bTarget.pt_data.index / 6)
                 local leadGroup    = chars[1].pt_data and math_floor(chars[1].pt_data.index / 6) or -1
                 if bTargetGroup ~= leadGroup then
@@ -479,81 +469,78 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     -- CHARACTER LOGIC
     ------------------------------------------------------------
     for _, c in ipairs(chars) do
-        if not c.is_main and c.in_zone and now > c.action_lock then
-            local pIdx   = c.pt_data.index
-            local entIdx = party:GetMemberTargetIndex(pIdx)
-            if entIdx > 0 then
-                local is_attacking = (ent:GetStatus(entIdx) == 1)
+        if not c.is_main then
+		-- Follow runs unconditionally — no zone/party gate.
+		-- actual_follow starts nil so the command always fires on first tick.
+		if c.f[1] and c.actual_follow ~= true then
+			qcmd('/mst ' .. c.name .. ' /ms follow on', true)
+			c.actual_follow = true
+		elseif not c.f[1] and c.actual_follow ~= false then
+			qcmd('/mst ' .. c.name .. ' /ms follow off', true)
+			c.actual_follow = false
+		end
 
-                -- Follow Logic
-                if c.f[1] and c.actual_follow ~= true then
-                    qcmd('/mst ' .. c.name .. ' /ms follow ' .. main_char.name, true)
-                    c.actual_follow = true
-                elseif not c.f[1] and c.actual_follow ~= false then
-                    qcmd('/mst ' .. c.name .. ' /ms follow off', true)
-                    c.actual_follow = false
-                end
+            -- Everything else needs zone presence and action lock
+            if c.in_zone and now > c.action_lock then
+                local pIdx   = c.pt_data.index
+                local entIdx = party:GetMemberTargetIndex(pIdx)
+                if entIdx > 0 then
+                    local is_attacking = (ent:GetStatus(entIdx) == 1)
 
-                -- Absorb TP Logic
-                if c.abs[1] and now > (c.abs_last or 0) + 30 then
-                    c.abs_last = now
-                    do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now)
-                end
+                    -- Absorb TP
+                    if c.abs[1] and now > (c.abs_last or 0) + 30 then
+                        c.abs_last = now
+                        do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now)
+                    end
 
-                -- Engage Logic
-                if c.e[1] then
-                    if main_is_attacking and engageTarget > 0 then
-                        local time_since = now - (c.last_engage_time or 0)
-                        if (c.last_engage_target ~= engageTarget or not is_attacking)
-                            and time_since >= ENGAGE_RETRY_GAP then
-                            local cmd = '/mst ' .. c.name .. ' /attack [t]'
-                            AshitaCore:GetChatManager():QueueCommand(1, cmd)
-                            queue_retry(c, cmd, now)
-                            c.last_engage_target = engageTarget
-                            c.auto_engaged       = true
-                            c.last_engage_time   = now
+                    -- Engage
+                    if c.e[1] then
+                        if main_is_attacking and engageTarget > 0 then
+                            local time_since = now - (c.last_engage_time or 0)
+                            if (c.last_engage_target ~= engageTarget or not is_attacking)
+                                and time_since >= ENGAGE_RETRY_GAP then
+                                local cmd = '/mst ' .. c.name .. ' /attack [t]'
+                                AshitaCore:GetChatManager():QueueCommand(1, cmd)
+                                queue_retry(c, cmd, now)
+                                c.last_engage_target = engageTarget
+                                c.auto_engaged       = true
+                                c.last_engage_time   = now
+                            end
+                        elseif not main_is_attacking and c.auto_engaged then
+                            if is_attacking then
+                                AshitaCore:GetChatManager():QueueCommand(1, '/mst ' .. c.name .. ' /attack off')
+                            end
+                            c.last_engage_target = 0
+                            c.auto_engaged       = false
+                            c.last_engage_time   = 0
+                            c.retry              = nil
                         end
-                    elseif not main_is_attacking and c.auto_engaged then
-                        -- main stopped fighting, auto-disengage
-                        if is_attacking then
-                            local cmd = '/mst ' .. c.name .. ' /attack off'
-                            AshitaCore:GetChatManager():QueueCommand(1, cmd)
+                    elseif is_attacking then
+                        AshitaCore:GetChatManager():QueueCommand(1, '/mst ' .. c.name .. ' /attack off')
+                        c.auto_engaged = false
+                        c.retry        = nil
+                    end
+
+                    -- Combat job abilities
+                    if is_attacking then
+                        local tp      = party:GetMemberTP(pIdx)
+                        local dist_sq = get_dist_sq(engageTarget, ent)
+
+                        if c.hs[1] and tp >= 350 and not c.buffs.samba then
+                            do_action(c, '/ja "Haste Samba" <me>', 1.5, now)
                         end
-                        c.last_engage_target = 0
-                        c.auto_engaged       = false
-                        c.last_engage_time   = 0
-                        c.retry              = nil
+
+                        if (c.bs[1] or c.qs[1]) and tp >= 100 and dist_sq < 36.0 and now > (c.step_last or 0) + 10 then
+                            local s = (c.bs[1] and c.qs[1])
+                                and (c.next_step == "Box Step" and "Quick Step" or "Box Step")
+                                or  (c.bs[1] and "Box Step" or "Quick Step")
+                            c.next_step, c.step_last = s, now
+                            do_action(c, string_format('/ja "%s" <t>', s), 1.5, now)
+                        end
                     end
-                elseif is_attacking then
-                    -- engage checkbox turned off mid-fight
-                    local cmd = '/mst ' .. c.name .. ' /attack off'
-                    AshitaCore:GetChatManager():QueueCommand(1, cmd)
-                    c.auto_engaged = false
-                    c.retry        = nil
+
+                    process_retry(c, now, party, ent)
                 end
-
-                -- Combat Job Logic
-                if is_attacking then
-                    local tp      = party:GetMemberTP(pIdx)
-                    local dist_sq = get_dist_sq(engageTarget, ent)
-
-                    -- Haste Samba
-                    if c.hs[1] and tp >= 350 and not c.buffs.samba then
-                        do_action(c, '/ja "Haste Samba" <me>', 1.5, now)
-                    end
-
-                    -- Steps
-                    if (c.bs[1] or c.qs[1]) and tp >= 100 and dist_sq < 36.0 and now > (c.step_last or 0) + 10 then
-                        local s = (c.bs[1] and c.qs[1])
-                            and (c.next_step == "Box Step" and "Quick Step" or "Box Step")
-                            or  (c.bs[1] and "Box Step" or "Quick Step")
-                        c.next_step, c.step_last = s, now
-                        do_action(c, string_format('/ja "%s" <t>', s), 1.5, now)
-                    end
-                end
-
-                -- Retry pending engage command if char still hasn't attacked
-                process_retry(c, now, party, ent)
             end
         end
     end
@@ -580,8 +567,6 @@ end
 
 ashita.events.register('d3d_present', 'render_ui', function()
     if not show_ui then return end
-    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, UI_PADDING)
-    imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, UI_SPACING)
     if imgui.Begin('Sync', {true}, bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar)) then
         if imgui.BeginTable('SyncTable', #ui_columns + 1, bit.bor(ImGuiTableFlags_Borders, ImGuiTableFlags_RowBg)) then
             imgui.TableSetupColumn('Name', 0, 50)
@@ -592,7 +577,7 @@ ashita.events.register('d3d_present', 'render_ui', function()
             imgui.EndTable()
         end
     end
-    imgui.End(); imgui.PopStyleVar(2)
+    imgui.End()
 end)
 
 ashita.events.register('command', 'cmd_logic', function(e)
