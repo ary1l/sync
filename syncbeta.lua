@@ -25,13 +25,13 @@ local ENGAGE_RETRY_GAP     = 0.5
 local lastTick = 0
 
 local chars = {
-    { name='muunch', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
+    { name='', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
       lastTarget=0, engaged=false, lastEngageTime=0, currentFollowState=nil, partyIndex=nil, retry=nil,
       hs_lastcast=-HS_COOLDOWN, bs_lastcast=-STEP_COOLDOWN, qs_lastcast=-STEP_COOLDOWN, autoEngaged=false },
-    { name='slowpoke', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
+    { name='', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
       lastTarget=0, engaged=false, lastEngageTime=0, currentFollowState=nil, partyIndex=nil, retry=nil,
       hs_lastcast=-HS_COOLDOWN, bs_lastcast=-STEP_COOLDOWN, qs_lastcast=-STEP_COOLDOWN, autoEngaged=false },
-    { name='goomy', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
+    { name='', engage=false, follow=false, hs_enabled=false, bs_enabled=false, qs_enabled=false,
       lastTarget=0, engaged=false, lastEngageTime=0, currentFollowState=nil, partyIndex=nil, retry=nil,
       hs_lastcast=-HS_COOLDOWN, bs_lastcast=-STEP_COOLDOWN, qs_lastcast=-STEP_COOLDOWN, autoEngaged=false },
 }
