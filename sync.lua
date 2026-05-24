@@ -598,12 +598,20 @@ ashita.events.register('command', 'cmd_logic', function(e)
             for _, g in ipairs(guests) do if g.name_lower:sub(1,#tr) == tr then target = g; break end end
         end
     end
-    if target == 'all' then
-        for _, c in ipairs(chars)  do if c[cmd] then c[cmd][1] = (state == nil) and (not c[cmd][1]) or state end end
-        for _, g in ipairs(guests) do if g[cmd] then g[cmd][1] = (state == nil) and (not g[cmd][1]) or state end end
-    elseif target and target[cmd] then
-        target[cmd][1] = (state == nil) and (not target[cmd][1]) or state
+if target == 'all' then
+    -- If no explicit state, determine from first char rather than toggling individually
+    local new_state = state
+    if new_state == nil then
+        -- Find first char that has this field and use the opposite of its current value
+        for _, c in ipairs(chars) do
+            if c[cmd] then new_state = not c[cmd][1]; break end
+        end
     end
+    for _, c in ipairs(chars)  do if c[cmd] then c[cmd][1] = new_state end end
+    for _, g in ipairs(guests) do if g[cmd] then g[cmd][1] = new_state end end
+elseif target and target[cmd] then
+    target[cmd][1] = (state == nil) and (not target[cmd][1]) or state
+end
 end)
 
 ashita.events.register('load', 'sync_load', function()
