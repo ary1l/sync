@@ -15,8 +15,7 @@ local mem_read_u32 = ashita.memory.read_uint32
 local math_floor   = math.floor
 local os_clock     = os.clock
 
--- Crew roster -- MUST match sync.lua's `chars`. MAIN is the box running sync
--- that collects every report. Used to classify party members as crew vs guest
+-- Crew roster -- MUST match sync.lua's `chars`. Used to classify party members as crew vs guest
 -- and to elect a single guest-reporter per detached alliance party.
 local CREW = {
     shaymin  = true,
@@ -27,7 +26,7 @@ local CREW = {
 }
 local MAIN = 'shaymin'
 
--- buff id -> report bit (same layout sync's rep handler decodes)
+-- buff id -> report bit
 local BUFF_ID_TO_BIT = {
     [33]  = 1,    -- Haste
     [265] = 2,    -- Flurry
@@ -53,8 +52,7 @@ local function self_flags(player)
     return flags
 end
 
--- Buff flags from a party status-icon block (address resolved by server id,
--- NOT by raw slot index -- the 6 blocks are not stored in party-slot order).
+-- Buff flags from a party status-icon block
 local function mem_flags(m)
     local flags = 0
     for j = 0, 31 do
@@ -82,8 +80,6 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
     local my_nl = my_name:lower()
 
     local player = mm:GetPlayer()
-
-    -- buff table pointer -- gate matches the original (no reports while unready)
     local ptr = AshitaCore:GetPointerManager():Get('party.statusicons')
     if not ptr or ptr == 0 then return end
     local buff_ptr = mem_read_u32(ptr)
@@ -91,7 +87,7 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
 
     -- Roster pass: name, server id, and ZONE for each local party slot.
     -- Zone matters because a member's buff block only exists in our status-icon
-    -- table when they share our zone -- so only a co-zoned crew member can read
+    -- table when they share our zone so only a co-zoned crew member can read
     -- a given guest. No buff memory is read here.
     local slot_nl, slot_sid, slot_zone = {}, {}, {}
     for slot = 0, 5 do
