@@ -1,7 +1,7 @@
 addon.name    = 'rdmhelper'
 addon.author  = 'aryl'
-addon.version = '1.6'
-addon.desc    = 'RDM Helper - Distributed Reporter'
+addon.version = '1.0'
+addon.desc    = 'RDM Helper - alliance buff scanning for sync.lua'
 
 require('common')
 local bit = require('bit')
