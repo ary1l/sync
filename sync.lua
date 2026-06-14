@@ -87,11 +87,11 @@ local silence_whitelist = {
 }
 
 local chars = {
-    { name='shaymin',  is_main=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
-    { name='goomy',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
-    { name='muunch',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
-    { name='slowpoke',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
-    { name='dreepy',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
+    { name='',  is_main=true, f={false}, e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
+    { name='',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
+    { name='',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
+    { name='',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
+    { name='',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, fl={false}, ref={false} },
 }
 
 local BUFF_PRIORITY = {"h","r","pro","sh","p"}
@@ -125,7 +125,6 @@ local NUM_UI_COLS = #ui_columns
 ------------------------------------------------------------
 -- HELPERS
 ------------------------------------------------------------
--- OPT 1: single constructor for the empty buff table (was duplicated 3x)
 local function blank_buffs()
     return { h=false, r=false, p=false, fl=false, comp=false, pro=false, sh=false, samba=false }
 end
@@ -259,48 +258,29 @@ for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower] = tru
 -- RDM HELPER FUNCTIONS
 ------------------------------------------------------------
 local function check_needs(t, key, rdm, now)
-    -- 1. Initial validation checks
     if not t or not t.in_zone or not t.pt_data or not t.buf or not t.buf[1] then return false end
-
     local is_self = (t.name_lower == rdm.name_lower)
-
-    -- 2. Composure check
     if key == 'comp' and rdm.buffs.comp then return false end
-
-    -- 3. Cross-Party restrictions for Refresh (r) and Phalanx (p)
     if (key == 'r' or key == 'p') and not is_self then
         if not rdm.pt_data or not t.pt_data then return false end
-        
         local rdm_party_group = math_floor(rdm.pt_data.index / 6)
         local t_party_group   = math_floor(t.pt_data.index / 6)
-        
         if rdm_party_group ~= t_party_group then
             return false
         end
     end
-
-    -- 4. Flurry conversion check
     local want = key
     if key == 'h' and t.fl and t.fl[1] then want = 'fl' end
-    
-    -- 5. Existing buff validation check
     if t.buffs and t.buffs[want] then return false end
-
-    -- 6. Refresh whitelist logic
     if key == 'r' and not is_self and not (t.ref and t.ref[1]) then return false end
-
-    -- 7. Action lock/Retry gap verification
     local locks = rdm.buff_locks[t.name]
     if not locks then locks = {}; rdm.buff_locks[t.name] = locks end
     if now - (locks[key] or 0) < BUFF_RETRY_GAP then return false end
-
     return true
 end
-
 ------------------------------------------------------------
 -- SCANNING
 ------------------------------------------------------------
--- OPT 2: shared reset for chars and guests (was two identical blocks)
 local function reset_list_combat(list)
     for _, e in ipairs(list) do
         for _, key in ipairs(COMBAT_FLAG_KEYS) do if e[key] then e[key][1] = false end end
@@ -311,12 +291,10 @@ local function reset_list_combat(list)
         e.debuff_pause       = false
     end
 end
-
 local function reset_combat_flags()
     reset_list_combat(chars)
     reset_list_combat(guests)
 end
-
 local function update_membership_and_zones(party)
     local my_zone = party:GetMemberZone(0)
     for _, v in pairs(current_active) do v.active_this_scan = false end
@@ -369,7 +347,7 @@ end
 
 local function scan_buff_list(t, slot_addr, myNameL, player, now)
     for _, c in ipairs(t) do
-        -- 1. REMOTE PROTECTIONS (Goomy, Slowpoke, Muunch)
+        -- 1. REMOTE PROTECTIONS
         -- If they belong to Party 2 or 3 (indices 6-17), skip memory scan entirely.
         -- Only wipe if we haven't received a network packet from them in 15 seconds.
         if c.pt_data and c.pt_data.index >= 6 then
@@ -379,7 +357,7 @@ local function scan_buff_list(t, slot_addr, myNameL, player, now)
             goto continue
         end
 
-        -- 2. LOCAL PARTY A MEMORY SCANNING (Shaymin & Local Guests)
+        -- 2. LOCAL PARTY A MEMORY SCANNING (main & same-pt guests)
         if c.in_zone and c.pt_data and c.pt_data.index < 6 then
             c.buffs.h = false; c.buffs.r = false; c.buffs.p = false; c.buffs.fl = false
             c.buffs.comp = false; c.buffs.pro = false; c.buffs.sh = false; c.buffs.samba = false
@@ -866,7 +844,7 @@ ashita.events.register('command', 'sync_rdmhelper_listener', function(e)
     if name and flags_str then
         e.blocked = true
         local flags = tonumber(flags_str) or 0
-        if name == "shaymin" then return end
+        if name == "" then return end
         
         local t = nil
         for _, c in ipairs(chars)  do if c.name_lower == name then t = c; break end end
@@ -905,10 +883,10 @@ end
 local presets = {
     on = {
         { 'buf', 'all',    true },
-        { 'deb', 'goomy',  true },
+        { 'deb', '',  true },
         { 'e',   'all',    true },
-        { 'bs',  'muunch', true },
-        { 'hs',  'muunch', true },
+        { 'bs',  '', true },
+        { 'hs',  '', true },
     },
 }
 
