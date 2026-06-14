@@ -6,7 +6,6 @@ addon.desc    = 'RDM Helper - Distributed Reporter'
 require('common')
 local bit = require('bit')
 
--- localized leaf calls (self via GetBuffs; guest slots via memory scan)
 local bit_lshift   = bit.lshift
 local bit_rshift   = bit.rshift
 local bit_band     = bit.band
@@ -16,7 +15,8 @@ local math_floor   = math.floor
 local os_clock     = os.clock
 
 -- Crew roster -- MUST match sync.lua's `chars`. Used to classify party members as crew vs guest
--- and to elect a single guest-reporter per detached alliance party.
+-- and to elect a single guest-reporter per detached alliance party. 
+-- MAIN is the character that runs sync.lua - everyone else runs ONLY rdmhelper
 local CREW = {
     shaymin  = true,
     goomy    = true,
