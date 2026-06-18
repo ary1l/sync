@@ -83,7 +83,7 @@ local BUFF_ID_TO_KEY = {
 
 local silence_whitelist = {
     ["imp"] = true,
-    ["eschan corse"] = true
+    ["specter worm"] = true
 }
 
 local chars = {
@@ -235,7 +235,7 @@ local function init_char_state(c)
     c.emergency_refresh = false
     c.in_zone      = false
     c.actual_follow = nil
-    c.buffs = blank_buffs()  -- OPT 1
+    c.buffs = blank_buffs()
     c.last_rep_time = 0
     c.ui_ids = {}
     c.last_engage_target = 0
@@ -258,26 +258,44 @@ for _, c in ipairs(chars) do init_char_state(c); known_cores[c.name_lower] = tru
 -- RDM HELPER FUNCTIONS
 ------------------------------------------------------------
 local function check_needs(t, key, rdm, now)
+    -- 1. Initial validation checks
     if not t or not t.in_zone or not t.pt_data or not t.buf or not t.buf[1] then return false end
+
     local is_self = (t.name_lower == rdm.name_lower)
+
+    -- 2. Composure check
     if key == 'comp' and rdm.buffs.comp then return false end
+
+    -- 3. Cross-Party restrictions for Refresh (r) and Phalanx (p)
     if (key == 'r' or key == 'p') and not is_self then
         if not rdm.pt_data or not t.pt_data then return false end
+        
         local rdm_party_group = math_floor(rdm.pt_data.index / 6)
         local t_party_group   = math_floor(t.pt_data.index / 6)
+        
         if rdm_party_group ~= t_party_group then
             return false
         end
     end
+
+    -- 4. Flurry conversion check
     local want = key
     if key == 'h' and t.fl and t.fl[1] then want = 'fl' end
+    
+    -- 5. Existing buff validation check
     if t.buffs and t.buffs[want] then return false end
+
+    -- 6. Refresh whitelist logic
     if key == 'r' and not is_self and not (t.ref and t.ref[1]) then return false end
+
+    -- 7. Action lock/Retry gap verification
     local locks = rdm.buff_locks[t.name]
     if not locks then locks = {}; rdm.buff_locks[t.name] = locks end
     if now - (locks[key] or 0) < BUFF_RETRY_GAP then return false end
+
     return true
 end
+
 ------------------------------------------------------------
 -- SCANNING
 ------------------------------------------------------------
@@ -291,10 +309,12 @@ local function reset_list_combat(list)
         e.debuff_pause       = false
     end
 end
+
 local function reset_combat_flags()
     reset_list_combat(chars)
     reset_list_combat(guests)
 end
+
 local function update_membership_and_zones(party)
     local my_zone = party:GetMemberZone(0)
     for _, v in pairs(current_active) do v.active_this_scan = false end
@@ -325,7 +345,7 @@ local function update_membership_and_zones(party)
     for k, v in pairs(current_active) do if not v.active_this_scan then current_active[k] = nil end end
     for _, c in ipairs(chars) do
         if not current_active[c.name_lower] then
-            c.buffs = blank_buffs()  -- OPT 1
+            c.buffs = blank_buffs()
             c.in_zone = false
         end
     end
@@ -352,12 +372,12 @@ local function scan_buff_list(t, slot_addr, myNameL, player, now)
         -- Only wipe if we haven't received a network packet from them in 15 seconds.
         if c.pt_data and c.pt_data.index >= 6 then
             if (now - c.last_rep_time) >= 15.0 then
-                c.buffs = blank_buffs()  -- OPT 1
+                c.buffs = blank_buffs()
             end
             goto continue
         end
 
-        -- 2. LOCAL PARTY A MEMORY SCANNING (main & same-pt guests)
+        -- 2. LOCAL PARTY A MEMORY SCANNING (main & Local Guests)
         if c.in_zone and c.pt_data and c.pt_data.index < 6 then
             c.buffs.h = false; c.buffs.r = false; c.buffs.p = false; c.buffs.fl = false
             c.buffs.comp = false; c.buffs.pro = false; c.buffs.sh = false; c.buffs.samba = false
@@ -405,71 +425,6 @@ local function scan_buffs(party, player, now)
 end
 
 ------------------------------------------------------------
--- GATE BROADCAST (sync -> rdmhelper instances)
-------------------------------------------------------------
-local GATE_BUF, GATE_FL, GATE_REF = 1, 2, 4
-
-local function member_mask(c)
-    if not (c.buf and c.buf[1]) then return 0 end
-    local m = GATE_BUF
-    if c.fl  and c.fl[1]  then m = m + GATE_FL  end
-    if c.ref and c.ref[1] then m = m + GATE_REF end
-    return m
-end
-
-local last_sent_mask = {}
-local last_sent_deb  = nil
-local last_keepalive = 0
-local KEEPALIVE      = 10.0
-
-local function broadcast_list(list, refresh)
-    for _, c in ipairs(list) do
-        local m = member_mask(c)
-        if m ~= (last_sent_mask[c.name_lower] or 0) or (refresh and m > 0) then
-            last_sent_mask[c.name_lower] = m
-            qcmd('/mso /rdmhelper gate ' .. c.name_lower .. ' ' .. m, true)
-        end
-    end
-end
-
-local function broadcast_gates(now)
-    local refresh = (now - last_keepalive >= KEEPALIVE)
-    if refresh then last_keepalive = now end
-    local deb_on = (cached_rdm and cached_rdm.deb[1]) or false
-    if deb_on ~= last_sent_deb or (refresh and deb_on) then
-        last_sent_deb = deb_on
-        qcmd('/mso /rdmhelper deb ' .. (deb_on and 'on' or 'off'), true)
-    end
-    broadcast_list(chars,  refresh)
-    broadcast_list(guests, refresh)
-end
-
-------------------------------------------------------------
--- MAIN SELF-REPORT (sync -> rdmhelper)
-------------------------------------------------------------
-local last_main_rep  = nil
-local last_main_time = 0
-local MAIN_REP_KEEPALIVE = 4.0
-
-local function broadcast_main_report(now)
-    local m = cached_main
-    if not m or not m.in_zone then return end
-    local b = m.buffs
-    local flags = 0
-    if b.h   then flags = flags + 1  end
-    if b.fl  then flags = flags + 2  end
-    if b.r   then flags = flags + 4  end
-    if b.p   then flags = flags + 8  end
-    if b.pro then flags = flags + 16 end
-    if b.sh  then flags = flags + 32 end
-    if flags ~= last_main_rep or now - last_main_time >= MAIN_REP_KEEPALIVE then
-        last_main_rep  = flags
-        last_main_time = now
-        qcmd('/mso /rdmhelper rep ' .. m.name_lower .. ' ' .. flags, true)
-    end
-end
-
-------------------------------------------------------------
 -- CORE LOGIC
 ------------------------------------------------------------
 local TICK_ACTION = 0.1
@@ -499,8 +454,6 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     if now - lastScanTick >= TICK_SCAN then
         update_membership_and_zones(party)
         scan_buffs(party, player, now)
-        broadcast_gates(now)
-        broadcast_main_report(now)
         lastScanTick = now
     end
 
@@ -673,21 +626,18 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     -- CHARACTER LOGIC
     ------------------------------------------------------------
     for _, c in ipairs(chars) do
-        local rdm_detached = c.is_rdm and not rdm_in_zone
-        if rdm_detached then
-            c.actual_follow = nil
-        end
-
         if not c.is_main then
-            if not rdm_detached then
-                local want_follow = c.f[1] and not c.debuff_pause
-                if want_follow and c.actual_follow ~= true then
-                    qcmd(c.cmd_follow_on, true)
-                    c.actual_follow = true
-                elseif not want_follow and c.actual_follow ~= false then
-                    qcmd(c.cmd_follow_off, true)
-                    c.actual_follow = false
-                end
+            -- FOLLOW: gated solely by the F checkbox (and debuff pause) and
+            -- issued party/zone-agnostically. Party changes do not break an
+            -- active follow, so there is nothing to tear down when crew move
+            -- between parties.
+            local want_follow = c.f[1] and not c.debuff_pause
+            if want_follow and c.actual_follow ~= true then
+                qcmd(c.cmd_follow_on, true)
+                c.actual_follow = true
+            elseif not want_follow and c.actual_follow ~= false then
+                qcmd(c.cmd_follow_off, true)
+                c.actual_follow = false
             end
             
             if c.in_zone and now > c.action_lock then
@@ -857,13 +807,13 @@ ashita.events.register('command', 'sync_rdmhelper_listener', function(e)
         
         if t then
             t.last_rep_time = os_clock()
-            t.buffs.h    = (bit.band(flags, 1) > 0)
-            t.buffs.fl   = (bit.band(flags, 2) > 0)
-            t.buffs.r    = (bit.band(flags, 4) > 0)
-            t.buffs.p    = (bit.band(flags, 8) > 0)
-            t.buffs.pro  = (bit.band(flags, 16) > 0)
-            t.buffs.sh   = (bit.band(flags, 32) > 0)
-            t.buffs.comp = (bit.band(flags, 64) > 0) 
+            t.buffs.h    = (bit_band(flags, 1) > 0)
+            t.buffs.fl   = (bit_band(flags, 2) > 0)
+            t.buffs.r    = (bit_band(flags, 4) > 0)
+            t.buffs.p    = (bit_band(flags, 8) > 0)
+            t.buffs.pro  = (bit_band(flags, 16) > 0)
+            t.buffs.sh   = (bit_band(flags, 32) > 0)
+            t.buffs.comp = (bit_band(flags, 64) > 0) 
         end
     end
 end)
@@ -928,11 +878,9 @@ ashita.events.register('load', 'sync_load', function()
     qcmd('/ms followme on', true)
     qcmd('/mso /ms follow on', true)
     qcmd('/mss /addon load rdmhelper', true)
-    qcmd('/mss /rdmhelper clear', true)
 end)
 
 ashita.events.register('unload', 'sync_unload', function()
-    qcmd('/mss /rdmhelper clear', true)
     qcmd('/ms followme off', true)
     qcmd('/mso /ms follow off', true)
     qcmd('/mss /addon unload rdmhelper', true)
