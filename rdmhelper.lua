@@ -1,7 +1,7 @@
 addon.name    = 'rdmhelper'
 addon.author  = 'aryl'
 addon.version = '1.0'
-addon.desc    = 'RDM Helper - alliance buff scanning for sync.lua'
+addon.desc    = 'RDM Helper - Distributed Reporter'
 
 require('common')
 local bit = require('bit')
@@ -14,19 +14,26 @@ local mem_read_u32 = ashita.memory.read_uint32
 local math_floor   = math.floor
 local os_clock     = os.clock
 
--- Crew roster -- MUST match sync.lua's `chars`. Used to classify party members as crew vs guest
--- and to elect a single guest-reporter per detached alliance party. 
--- MAIN is the character that runs sync.lua - everyone else runs ONLY rdmhelper
-local CREW = {
-    shaymin  = true,
-    goomy    = true,
-    muunch   = true,
-    slowpoke = true,
-    dreepy   = true,
-}
-local MAIN = 'shaymin'
+local AshitaCore  = AshitaCore
+local mm          = AshitaCore:GetMemoryManager()
+local chat        = AshitaCore:GetChatManager()
+local pointer_mgr = AshitaCore:GetPointerManager()
 
--- buff id -> report bit
+-- Crew roster -- MUST match sync.lua's `chars`. MAIN is the box running sync
+-- that collects every report. Used to classify party members as crew vs guest
+-- and to elect a single guest-reporter per detached alliance party.
+local CREW = {
+      = true,
+        = true,
+       = true,
+     = true,
+   = true,
+}
+local MAIN = ''
+
+local REP_PREFIX = '/mst ' .. MAIN .. ' /rdmhelper rep '
+
+-- buff id -> report bit (same layout sync's rep handler decodes)
 local BUFF_ID_TO_BIT = {
     [33]  = 1,    -- Haste
     [265] = 2,    -- Flurry
@@ -40,6 +47,12 @@ local BUFF_ID_TO_BIT = {
 local last_tick = 0
 local dbg = false   -- toggle with /rdmhelper dbg (prints to THIS box's log)
 
+-- Single emitter for a report line -- centralizes the wire format so the
+-- two senders (self report + guest relay) cannot drift.
+local function report(name, flags)
+    chat:QueueCommand(1, REP_PREFIX .. name .. ' ' .. flags)
+end
+
 -- Self buff flags from the player object.
 local function self_flags(player)
     if not player then return 0 end
@@ -52,14 +65,16 @@ local function self_flags(player)
     return flags
 end
 
--- Buff flags from a party status-icon block
+-- Buff flags from a party status-icon block (address resolved by server id,
+-- NOT by raw slot index -- the 6 blocks are not stored in party-slot order).
 local function mem_flags(m)
     local flags = 0
+    local hi
     for j = 0, 31 do
         local low = mem_read_u8(m + 16 + j)
         if low == 255 then break end
         local bp = j % 4
-        local hi = mem_read_u8(m + 8 + math_floor(j / 4))
+        if bp == 0 then hi = mem_read_u8(m + 8 + math_floor(j / 4)) end
         local fb = BUFF_ID_TO_BIT[bit_lshift(bit_band(bit_rshift(hi, bp * 2), 0x03), 8) + low]
         if fb then flags = flags + fb end
     end
@@ -71,7 +86,6 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
     if now - last_tick < 1.0 then return end
     last_tick = now
 
-    local mm = AshitaCore:GetMemoryManager()
     local party = mm and mm:GetParty()
     if not party then return end
 
@@ -80,14 +94,16 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
     local my_nl = my_name:lower()
 
     local player = mm:GetPlayer()
-    local ptr = AshitaCore:GetPointerManager():Get('party.statusicons')
+
+    -- buff table pointer -- gate matches the original (no reports while unready)
+    local ptr = pointer_mgr:Get('party.statusicons')
     if not ptr or ptr == 0 then return end
     local buff_ptr = mem_read_u32(ptr)
     if not buff_ptr or buff_ptr == 0 then return end
 
     -- Roster pass: name, server id, and ZONE for each local party slot.
     -- Zone matters because a member's buff block only exists in our status-icon
-    -- table when they share our zone so only a co-zoned crew member can read
+    -- table when they share our zone -- so only a co-zoned crew member can read
     -- a given guest. No buff memory is read here.
     local slot_nl, slot_sid, slot_zone = {}, {}, {}
     for slot = 0, 5 do
@@ -154,14 +170,12 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
         end
     end
 
-    local chat = AshitaCore:GetChatManager()
-
-    -- 1. SELF REPORT (always) -- every crew box reports its own buffs.
-    if slot_nl[0] then
-        chat:QueueCommand(1, '/mst shaymin /rdmhelper rep ' .. my_nl .. ' ' .. self_flags(player))
+    -- 1. SELF REPORT -- every crew box reports its own buffs, EXCEPT the main box.
+    if slot_nl[0] and my_nl ~= MAIN then
+        report(my_nl, self_flags(player))
     end
 
-    -- 2. GUEST RELAY -- relay each non-crew member I'm the co-zoned elected
+    -- 2. GUEST RELAY -- relay each non-crew member that they are the co-zoned elected
     -- reporter for. Crew self-report (slot 0 above + their own boxes), so they're
     -- skipped here.
     for slot = 1, 5 do
@@ -169,7 +183,7 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
         if nl and not CREW[nl] and reporter_for(slot_zone[slot]) == my_nl then
             local m = block_for(slot_sid[slot])
             if m then
-                chat:QueueCommand(1, '/mst shaymin /rdmhelper rep ' .. nl .. ' ' .. mem_flags(m))
+                report(nl, mem_flags(m))
             end
         end
     end
@@ -178,7 +192,7 @@ end)
 ashita.events.register('command', 'rdmhelper_cmd', function(e)
     local args = e.command:args()
     if not args or args[1] ~= '/rdmhelper' then return end
-    if args[2] == 'rep' then return end
+    if args[2] == 'rep' then return end   -- our report verb; sync consumes it on the main box, ignored elsewhere
     if args[2] == 'dbg' then
         dbg = not dbg
         print('[rdmhelper] debug ' .. (dbg and 'ON' or 'OFF'))
