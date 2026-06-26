@@ -1,17 +1,20 @@
 addon.name    = 'rdmhelper'
 addon.author  = 'aryl'
-addon.version = '1.0'
+addon.version = '1.5'
 addon.desc    = 'RDM Helper - Distributed Reporter'
 
 require('common')
 local bit = require('bit')
 
+-- localized leaf calls (self via GetBuffs; guest slots via memory scan)
 local bit_lshift   = bit.lshift
 local bit_rshift   = bit.rshift
 local bit_band     = bit.band
+local bit_bor      = bit.bor
 local mem_read_u8  = ashita.memory.read_uint8
 local mem_read_u32 = ashita.memory.read_uint32
 local math_floor   = math.floor
+local math_atan2   = math.atan2
 local os_clock     = os.clock
 
 local AshitaCore  = AshitaCore
@@ -23,13 +26,13 @@ local pointer_mgr = AshitaCore:GetPointerManager()
 -- that collects every report. Used to classify party members as crew vs guest
 -- and to elect a single guest-reporter per detached alliance party.
 local CREW = {
-      = true,
-        = true,
-       = true,
-     = true,
-   = true,
+    shaymin  = true,
+    goomy    = true,
+    muunch   = true,
+    slowpoke = true,
+    dreepy   = true,
 }
-local MAIN = ''
+local MAIN = 'shaymin'
 
 local REP_PREFIX = '/mst ' .. MAIN .. ' /rdmhelper rep '
 
@@ -42,15 +45,107 @@ local BUFF_ID_TO_BIT = {
     [40]  = 16,   -- Protect
     [41]  = 32,   -- Shell
     [419] = 64,   -- Composure
+    -- Healer stances -- reported so sync can gate them cross-party (no re-fire
+    -- when a detached healer already has the stance up). MUST match sync's decode.
+    [358] = 128,  -- Light Arts
+    [401] = 256,  -- Addendum: White
+    [417] = 512,  -- Afflatus Solace
 }
+
+-- removable detrimental status id -> report bit. MUST stay identical to sync's
+-- STATUS_ID_TO_BIT. Bits 1..128 are dedicated -na ailments; bit 256 is the
+-- aggregate "an Erase-removable effect is present".
+local STATUS_ID_TO_BIT = {
+    [3]  = 1,    -- Poison        -> Poisona
+    [4]  = 2,    -- Paralysis     -> Paralyna
+    [5]  = 4,    -- Blindness     -> Blindna
+    [6]  = 8,    -- Silence       -> Silena
+    [7]  = 16,   -- Petrification -> Stona
+    [8]  = 32,   -- Disease       -> Viruna
+    [31] = 32,   -- Plague        -> Viruna
+    [9]  = 64,   -- Curse         -> Cursna
+    [15] = 128,  -- Doom          -> Cursna
+    -- Special-case bits (NOT -na/Erase removable):
+    [14] = 512,  -- Charm
+    [17] = 512,  -- Charm (II)
+    [2]  = 1024, -- Sleep
+    [19] = 1024, -- Sleep (II)
+}
+-- Every Erase-removable status id collapses to bit 256.
+local ERASE_BIT = 256
+local ERASE_IDS = {
+    12,  -- Weight
+    13,  -- Slow
+    21,  -- Addle
+    128, -- Burn
+    129, -- Frost
+    130, -- Choke
+    131, -- Rasp
+    132, -- Shock
+    133, -- Drown
+    134, -- Dia
+    135, -- Bio
+    136, -- STR Down
+    137, -- DEX Down
+    138, -- VIT Down
+    139, -- AGI Down
+    140, -- INT Down
+    141, -- MND Down
+    142, -- CHR Down
+    144, -- Max HP Down
+    145, -- Max MP Down
+    146, -- Accuracy Down
+    147, -- Attack Down
+    148, -- Evasion Down
+    149, -- Defense Down
+    156, -- Flash
+    167, -- Magic Def Down
+    174, -- Magic Acc Down
+    175, -- Magic Atk Down
+    186, -- Helix
+    189, -- Max TP Down
+    192, -- Requiem
+    194, -- Elegy
+    298, -- Critical Hit Evasion Down
+    404, -- Magic Evasion Down
+}
+for _, id in ipairs(ERASE_IDS) do STATUS_ID_TO_BIT[id] = ERASE_BIT end
 
 local last_tick = 0
 local dbg = false   -- toggle with /rdmhelper dbg (prints to THIS box's log)
 
+-- OPT: report de-duplication. Steady state (a stable buff/status set) used to put
+-- one /mst line on the wire per crew box AND per relayed guest EVERY tick. Now a
+-- line is emitted only when its payload changes, with a periodic keepalive so
+-- sync's freshness gates never lapse on an unchanged set (stance readability ~5s,
+-- buff/status expiry 15s). Cuts steady-state Multisend / chat-queue load sharply
+-- while making real changes propagate at least as fast as before.
+local REPORT_KEEPALIVE = 3.0
+local self_sig, self_emit = nil, 0
+local guest_sig, guest_emit = {}, {}
+
 -- Single emitter for a report line -- centralizes the wire format so the
 -- two senders (self report + guest relay) cannot drift.
-local function report(name, flags)
-    chat:QueueCommand(1, REP_PREFIX .. name .. ' ' .. flags)
+local function report(name, bflags, sflags, mjob, sjob, sjlvl)
+    chat:QueueCommand(1, REP_PREFIX .. name .. ' ' .. bflags .. ' ' .. sflags .. ' ' .. mjob .. ' ' .. sjob .. ' ' .. sjlvl)
+end
+
+-- OPT: emit a self report only on change, or once every REPORT_KEEPALIVE.
+local function report_self(name, b, s, mj, sj, sl, now)
+    local sig = b .. ' ' .. s .. ' ' .. mj .. ' ' .. sj .. ' ' .. sl
+    if sig ~= self_sig or (now - self_emit) >= REPORT_KEEPALIVE then
+        self_sig, self_emit = sig, now
+        report(name, b, s, mj, sj, sl)
+    end
+end
+
+-- OPT: emit a guest relay only on change, or once every REPORT_KEEPALIVE.
+local function report_guest(name, b, s, now)
+    local sig = b .. ' ' .. s
+    if sig ~= guest_sig[name] or (now - (guest_emit[name] or 0)) >= REPORT_KEEPALIVE then
+        guest_sig[name], guest_emit[name] = sig, now
+        report(name, b, s, 0, 0, 0)
+    end
 end
 
 -- Self buff flags from the player object.
@@ -63,6 +158,18 @@ local function self_flags(player)
         if fb then flags = flags + fb end
     end
     return flags
+end
+
+-- Self removable-status flags from the player object.
+local function self_status(player)
+    if not player then return 0 end
+    local bits = 0
+    local buffs = player:GetBuffs()
+    for i = 0, 31 do
+        local fb = STATUS_ID_TO_BIT[buffs[i]]
+        if fb then bits = bit_bor(bits, fb) end
+    end
+    return bits
 end
 
 -- Buff flags from a party status-icon block (address resolved by server id,
@@ -79,6 +186,21 @@ local function mem_flags(m)
         if fb then flags = flags + fb end
     end
     return flags
+end
+
+-- Removable detrimental statuses from a party status-icon block.
+local function mem_status(m)
+    local bits = 0
+    local hi
+    for j = 0, 31 do
+        local low = mem_read_u8(m + 16 + j)
+        if low == 255 then break end
+        local bp = j % 4
+        if bp == 0 then hi = mem_read_u8(m + 8 + math_floor(j / 4)) end
+        local fb = STATUS_ID_TO_BIT[bit_lshift(bit_band(bit_rshift(hi, bp * 2), 0x03), 8) + low]
+        if fb then bits = bit_bor(bits, fb) end
+    end
+    return bits
 end
 
 ashita.events.register('d3d_present', 'rdmhelper_loop', function()
@@ -156,14 +278,14 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
             if nl then
                 local info
                 if s == 0 then
-                    info = 'self flags=' .. self_flags(player)
+                    info = 'self flags=' .. self_flags(player) .. ' st=' .. self_status(player)
                 elseif CREW[nl] then
                     info = 'crew (self-reports)'
                 else
                     local m = block_for(slot_sid[s])
-                    info = ('guest zone=%d rep=%s block=%s flags=%d'):format(
+                    info = ('guest zone=%d rep=%s block=%s flags=%d st=%d'):format(
                         slot_zone[s] or -1, tostring(reporter_for(slot_zone[s])),
-                        m and 'OK' or 'MISS', m and mem_flags(m) or 0)
+                        m and 'OK' or 'MISS', m and mem_flags(m) or 0, m and mem_status(m) or 0)
                 end
                 print(('[rdmhelper]   slot%d %s sid=%d %s'):format(s, nl, slot_sid[s], info))
             end
@@ -172,7 +294,8 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
 
     -- 1. SELF REPORT -- every crew box reports its own buffs, EXCEPT the main box.
     if slot_nl[0] and my_nl ~= MAIN then
-        report(my_nl, self_flags(player))
+        report_self(my_nl, self_flags(player), self_status(player),
+               player:GetMainJob() or 0, player:GetSubJob() or 0, player:GetSubJobLevel() or 0, now)
     end
 
     -- 2. GUEST RELAY -- relay each non-crew member that they are the co-zoned elected
@@ -183,7 +306,7 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
         if nl and not CREW[nl] and reporter_for(slot_zone[slot]) == my_nl then
             local m = block_for(slot_sid[slot])
             if m then
-                report(nl, mem_flags(m))
+                report_guest(nl, mem_flags(m), mem_status(m), now)
             end
         end
     end
@@ -198,6 +321,5 @@ ashita.events.register('command', 'rdmhelper_cmd', function(e)
         print('[rdmhelper] debug ' .. (dbg and 'ON' or 'OFF'))
         e.blocked = true
         return
-    end
-    e.blocked = true
-end)
+		end
+	end)
