@@ -1,6 +1,6 @@
 addon.name    = 'rdmhelper'
 addon.author  = 'aryl'
-addon.version = '1.5'
+addon.version = '1.0'
 addon.desc    = 'RDM Helper - Distributed Reporter'
 
 require('common')
@@ -14,7 +14,6 @@ local bit_bor      = bit.bor
 local mem_read_u8  = ashita.memory.read_uint8
 local mem_read_u32 = ashita.memory.read_uint32
 local math_floor   = math.floor
-local math_atan2   = math.atan2
 local os_clock     = os.clock
 
 local AshitaCore  = AshitaCore
@@ -45,11 +44,13 @@ local BUFF_ID_TO_BIT = {
     [40]  = 16,   -- Protect
     [41]  = 32,   -- Shell
     [419] = 64,   -- Composure
+	[113] = 2048, -- Reraise
     -- Healer stances -- reported so sync can gate them cross-party (no re-fire
     -- when a detached healer already has the stance up). MUST match sync's decode.
     [358] = 128,  -- Light Arts
     [401] = 256,  -- Addendum: White
     [417] = 512,  -- Afflatus Solace
+    [621] = 1024, -- Majesty (PLD)
 }
 
 -- removable detrimental status id -> report bit. MUST stay identical to sync's
@@ -70,10 +71,12 @@ local STATUS_ID_TO_BIT = {
     [17] = 512,  -- Charm (II)
     [2]  = 1024, -- Sleep
     [19] = 1024, -- Sleep (II)
+    [193] = 1024, -- Lullaby  
 }
 -- Every Erase-removable status id collapses to bit 256.
 local ERASE_BIT = 256
 local ERASE_IDS = {
+    11,  -- Bind        
     12,  -- Weight
     13,  -- Slow
     21,  -- Addle
@@ -112,14 +115,7 @@ local ERASE_IDS = {
 for _, id in ipairs(ERASE_IDS) do STATUS_ID_TO_BIT[id] = ERASE_BIT end
 
 local last_tick = 0
-local dbg = false   -- toggle with /rdmhelper dbg (prints to THIS box's log)
 
--- OPT: report de-duplication. Steady state (a stable buff/status set) used to put
--- one /mst line on the wire per crew box AND per relayed guest EVERY tick. Now a
--- line is emitted only when its payload changes, with a periodic keepalive so
--- sync's freshness gates never lapse on an unchanged set (stance readability ~5s,
--- buff/status expiry 15s). Cuts steady-state Multisend / chat-queue load sharply
--- while making real changes propagate at least as fast as before.
 local REPORT_KEEPALIVE = 3.0
 local self_sig, self_emit = nil, 0
 local guest_sig, guest_emit = {}, {}
@@ -130,7 +126,6 @@ local function report(name, bflags, sflags, mjob, sjob, sjlvl)
     chat:QueueCommand(1, REP_PREFIX .. name .. ' ' .. bflags .. ' ' .. sflags .. ' ' .. mjob .. ' ' .. sjob .. ' ' .. sjlvl)
 end
 
--- OPT: emit a self report only on change, or once every REPORT_KEEPALIVE.
 local function report_self(name, b, s, mj, sj, sl, now)
     local sig = b .. ' ' .. s .. ' ' .. mj .. ' ' .. sj .. ' ' .. sl
     if sig ~= self_sig or (now - self_emit) >= REPORT_KEEPALIVE then
@@ -139,7 +134,6 @@ local function report_self(name, b, s, mj, sj, sl, now)
     end
 end
 
--- OPT: emit a guest relay only on change, or once every REPORT_KEEPALIVE.
 local function report_guest(name, b, s, now)
     local sig = b .. ' ' .. s
     if sig ~= guest_sig[name] or (now - (guest_emit[name] or 0)) >= REPORT_KEEPALIVE then
@@ -148,59 +142,35 @@ local function report_guest(name, b, s, now)
     end
 end
 
--- Self buff flags from the player object.
-local function self_flags(player)
-    if not player then return 0 end
-    local flags = 0
+local function self_scan(player)
+    if not player then return 0, 0 end
+    local flags, bits = 0, 0
     local buffs = player:GetBuffs()
     for i = 0, 31 do
-        local fb = BUFF_ID_TO_BIT[buffs[i]]
-        if fb then flags = flags + fb end
+        local id = buffs[i]
+        local fb = BUFF_ID_TO_BIT[id]
+        if fb then flags = bit_bor(flags, fb) end
+        local sb = STATUS_ID_TO_BIT[id]
+        if sb then bits = bit_bor(bits, sb) end
     end
-    return flags
+    return flags, bits
 end
 
--- Self removable-status flags from the player object.
-local function self_status(player)
-    if not player then return 0 end
-    local bits = 0
-    local buffs = player:GetBuffs()
-    for i = 0, 31 do
-        local fb = STATUS_ID_TO_BIT[buffs[i]]
-        if fb then bits = bit_bor(bits, fb) end
-    end
-    return bits
-end
-
--- Buff flags from a party status-icon block (address resolved by server id,
--- NOT by raw slot index -- the 6 blocks are not stored in party-slot order).
-local function mem_flags(m)
-    local flags = 0
+local function mem_scan(m)
+    local flags, bits = 0, 0
     local hi
     for j = 0, 31 do
         local low = mem_read_u8(m + 16 + j)
         if low == 255 then break end
         local bp = j % 4
         if bp == 0 then hi = mem_read_u8(m + 8 + math_floor(j / 4)) end
-        local fb = BUFF_ID_TO_BIT[bit_lshift(bit_band(bit_rshift(hi, bp * 2), 0x03), 8) + low]
-        if fb then flags = flags + fb end
+        local id = bit_lshift(bit_band(bit_rshift(hi, bp * 2), 0x03), 8) + low
+        local fb = BUFF_ID_TO_BIT[id]
+        if fb then flags = bit_bor(flags, fb) end
+        local sb = STATUS_ID_TO_BIT[id]
+        if sb then bits = bit_bor(bits, sb) end
     end
-    return flags
-end
-
--- Removable detrimental statuses from a party status-icon block.
-local function mem_status(m)
-    local bits = 0
-    local hi
-    for j = 0, 31 do
-        local low = mem_read_u8(m + 16 + j)
-        if low == 255 then break end
-        local bp = j % 4
-        if bp == 0 then hi = mem_read_u8(m + 8 + math_floor(j / 4)) end
-        local fb = STATUS_ID_TO_BIT[bit_lshift(bit_band(bit_rshift(hi, bp * 2), 0x03), 8) + low]
-        if fb then bits = bit_bor(bits, fb) end
-    end
-    return bits
+    return flags, bits
 end
 
 ashita.events.register('d3d_present', 'rdmhelper_loop', function()
@@ -269,32 +239,10 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
         return addr_by_sid[sid]
     end
 
-    if dbg then
-        local r = {}
-        for s = 0, 5 do if slot_nl[s] then r[#r + 1] = slot_nl[s] end end
-        print(('[rdmhelper] %s party=[%s]'):format(my_nl, table.concat(r, ',')))
-        for s = 0, 5 do
-            local nl = slot_nl[s]
-            if nl then
-                local info
-                if s == 0 then
-                    info = 'self flags=' .. self_flags(player) .. ' st=' .. self_status(player)
-                elseif CREW[nl] then
-                    info = 'crew (self-reports)'
-                else
-                    local m = block_for(slot_sid[s])
-                    info = ('guest zone=%d rep=%s block=%s flags=%d st=%d'):format(
-                        slot_zone[s] or -1, tostring(reporter_for(slot_zone[s])),
-                        m and 'OK' or 'MISS', m and mem_flags(m) or 0, m and mem_status(m) or 0)
-                end
-                print(('[rdmhelper]   slot%d %s sid=%d %s'):format(s, nl, slot_sid[s], info))
-            end
-        end
-    end
-
     -- 1. SELF REPORT -- every crew box reports its own buffs, EXCEPT the main box.
     if slot_nl[0] and my_nl ~= MAIN then
-        report_self(my_nl, self_flags(player), self_status(player),
+        local bf, sf = self_scan(player)
+        report_self(my_nl, bf, sf,
                player:GetMainJob() or 0, player:GetSubJob() or 0, player:GetSubJobLevel() or 0, now)
     end
 
@@ -306,7 +254,8 @@ ashita.events.register('d3d_present', 'rdmhelper_loop', function()
         if nl and not CREW[nl] and reporter_for(slot_zone[slot]) == my_nl then
             local m = block_for(slot_sid[slot])
             if m then
-                report_guest(nl, mem_flags(m), mem_status(m), now)
+                local bf, sf = mem_scan(m)
+                report_guest(nl, bf, sf, now)
             end
         end
     end
@@ -316,10 +265,17 @@ ashita.events.register('command', 'rdmhelper_cmd', function(e)
     local args = e.command:args()
     if not args or args[1] ~= '/rdmhelper' then return end
     if args[2] == 'rep' then return end   -- our report verb; sync consumes it on the main box, ignored elsewhere
-    if args[2] == 'dbg' then
-        dbg = not dbg
-        print('[rdmhelper] debug ' .. (dbg and 'ON' or 'OFF'))
+    if args[2] == 'crew' then
+        -- Roster push from sync. args[3] = MAIN (the sync box); args[3..] = full crew.
+        if args[3] then
+            CREW = {}
+            for i = 3, #args do CREW[args[i]:lower()] = true end
+            MAIN = args[3]:lower()
+            REP_PREFIX = '/mst ' .. MAIN .. ' /rdmhelper rep '
+            self_sig, self_emit = nil, 0
+            guest_sig, guest_emit = {}, {}
+        end
         e.blocked = true
         return
-		end
-	end)
+    end
+end)
