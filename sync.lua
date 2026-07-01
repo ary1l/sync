@@ -67,6 +67,7 @@ local STYLE_BTN = {
     -- {0.4,1.0,0.4,1.0} table twice every frame. Saves steady GC churn at the
     -- 200-local ceiling cost of zero new locals/upvalues.
     geo    = {0.4, 1.0, 0.4, 1.0},
+    brd    = {0.75, 0.4, 1.0, 1.0},  -- purple for Singer / BRD panel toggle
 }
 
 -- NOTE: tooltip helper. Call IMMEDIATELY after the imgui item to tip. Cheap (one
@@ -87,10 +88,11 @@ local show_guests = true
 local show_advanced = false
 local show_buffpanel = false
 local show_debuffpanel = false
+
 local adv_seeded   = false
-local ENGAGE_RETRY_GAP = 0.5
-local RETRY_DELAY      = 0.7
-local FOLLOW_SETTLE    = 0.5
+-- OPT: three follow-timing constants collapsed into one table to reclaim two
+-- locals against the 200-local ceiling (combat mode needs the headroom).
+local TIMING = { engage = 0.5, retry = 0.7, settle = 0.5 }
 
 local BUFF_IDS = {
     HASTE = 33, PROTECT = 40, SHELL = 41, REFRESH = 43,
@@ -115,11 +117,11 @@ local BUFF_ID_TO_KEY = {
 }
 
 local chars = {
-    { name='shaymin',  is_main=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false} },
-    { name='goomy',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false} },
-    { name='muunch',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false} },
-    { name='slowpoke',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false} },
-    { name='dreepy',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false} },
+    { name='shaymin',  is_main=true, f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false}, face={true}, hunt={false}, runto={false} },
+    { name='goomy',    is_rdm=true,  f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false}, face={true}, hunt={false}, runto={false} },
+    { name='muunch',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false}, face={true}, hunt={false}, runto={false} },
+    { name='slowpoke',               f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false}, face={true}, hunt={false}, runto={false} },
+    { name='dreepy',                 f={true},  e={false}, hs={false}, bs={false}, qs={false}, abs={false}, deb={false}, buf={false}, heal={false}, fl={false}, ref={false}, face={true}, hunt={false}, runto={false} },
 }
 
 local BUFF_PRIORITY = {"h","r","pro","sh","p"}
@@ -139,7 +141,7 @@ local last_engage_target = 0
 
 local ui_columns = {
     { label = 'F', key = 'f',    hdr = 'flw',  tip = 'Follow main  (/sync f [name|all] [on|off])',                              allow_main = false, rdm_only = false },
-    { label = 'E', key = 'e',    hdr = 'eng',  tip = 'Engage Tracking  (/sync e [name|all] [on|off])',                          allow_main = false, rdm_only = false },
+    { label = 'E', key = 'e',    hdr = 'eng',  tip = 'Engage Tracking - click header to open Combat panel  (/sync e [name|all] [on|off]; /sync combat)',                          allow_main = false, rdm_only = false },
     { label = 'H', key = 'hs',   hdr = 'hsam', tip = 'Haste Samba  (/sync hs [name|all] [on|off])',                             allow_main = false, rdm_only = false },
     { label = 'B', key = 'bs',   hdr = 'box',  tip = 'Box Step  (/sync bs [name|all] [on|off])',                                allow_main = false, rdm_only = false },
     { label = 'Q', key = 'qs',   hdr = 'qui',  tip = 'Quick Step  (/sync qs [name|all] [on|off])',                              allow_main = false, rdm_only = false },
@@ -183,6 +185,162 @@ local geo_mod = {
 for i = 1, #geo_mod.suffixes do
     geo_mod.indi_spells[i] = 'Indi-' .. geo_mod.suffixes[i]
     geo_mod.geo_spells[i]  = 'Geo-'  .. geo_mod.suffixes[i]
+end
+
+------------------------------------------------------------
+-- COMBAT / HUNT (face-lock + radius pack-hunting)
+------------------------------------------------------------
+-- All combat-mode state folded into one module table to stay under LuaJIT's
+-- 200-local ceiling. Per-character toggles (c.face / c.hunt) live on the chars
+-- entries (mirrors c.e). Radius + per-box mob whitelists persist in
+-- config.combat (radius, lists[name_lower] = T{...}); face/hunt toggles are
+-- runtime and reset on zone with the other combat flags.
+--
+-- Radius is gated PER-HUNTER (each box's own position vs the mob), since alts
+-- can be far from the main. Claim semantics mirror targetbar: low 16 bits of
+-- GetClaimStatus, 0 = unclaimed, else a crew sId (masked 0xFFFF) = ours. Spawn
+-- bits: 0x10 = mob, 0x01 = PC (excluded, drops players/trusts).
+local hunt_mod = {
+    show_panel = false,
+    open  = {true},
+    flags = bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar),
+    scan_gap   = 2.0,   -- HUNT_SCAN_GAP: rebuild candidate pool at most this often
+    next_scan  = 0,
+    mob_lo     = 1,     -- entity index scan range for mobs (players sit 0x700+)
+    mob_hi     = 0x6FF,
+    radius_buf = {12.0}, -- panel input mirror of config.combat.radius
+    -- scratch (reused each pass; never re-alloc in the hot loop)
+    cand       = {},    -- ordered candidate mob indices (in radius, valid, free-claim)
+    cand_hp    = {},    -- [idx] = hp pct  (for highest-HP fallback)
+    cand_dist  = {},    -- [idx] = dist^2  (for nearest-first assignment)
+    taken      = {},    -- [idx] = true    (mob already assigned this pass)
+    crew_mask  = {},    -- [sId & 0xFFFF] = true (in-zone crew, for claim gate)
+    engaged    = {},    -- union of crew-engaged mob indices (RDM multi-target)
+    eng_n      = 0,
+    addbuf     = {},    -- [name_lower] = {''} input buffer for whitelist add
+    pullbuf    = {},    -- [name_lower] = {cmd} input buffer for pull action
+    rdiabuf    = nil,   -- {cmd} input buffer for the RDM hunt-debuff command
+    blbuf      = {''},  -- input buffer for blacklist add
+    pulldistbuf = {},   -- [name_lower] -> {n} slider buffer for that box's pull distance
+    frangbuf    = {},   -- [name_lower] -> {n} slider buffer for that box's fight (leash) range
+    main_goto  = { active = false, x = 0, y = 0, deadline = 0 },  -- main campsite move
+    -- RDM hunt-debuff bookkeeping: [idx] = os_clock of last Dia III sent
+    diaed      = {},
+    -- facing calibration offset (radians) added to every yaw write; set via
+    -- /sync faced once, persisted to config.combat.yaw_off.
+    yaw_off    = 0.0,
+}
+
+------------------------------------------------------------
+-- BRD (Bard song cycle -- integrated Singer)
+------------------------------------------------------------
+-- Singer folded into sync as a remote scheduler. Sync runs on the MAIN only, so
+-- the bard (an alt) is driven by forwarding every song/JA with do_action via the
+-- bard mst_prefix (/mst <character> ...), paced by that box action_lock --
+-- structurally identical to the GEO scheduler. The main can't read the bard
+-- recast timers or its song-JA buffs, and it doesn't try to: each enabled JA is
+-- ATTEMPTED ONCE PER CYCLE (Marcato/Pianissimo once per row) straight off the
+-- playlist toggles -- if it's on cooldown the game ignores the command and the
+-- cycle moves on. All state + the song dictionary + UI buffers hang off this one
+-- table to keep the main chunk under the 200-local ceiling (no new local; the
+-- subsystem rides on geo_mod, the established multi-feature container).
+geo_mod.brd = {
+    show_window = false,
+    open  = {true},
+    flags = bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar),
+    poll  = 0.1,            -- min seconds between scheduler ticks
+    next_check = 0,
+    ja_lock   = 1.2,        -- action_lock seconds applied after a JA fire
+    song_cast = 4.0,        -- base song cast estimate; config.brd.delay is added on top
+    seeded = false,
+    -- Cycle: idx walks the playlist 1..#songs+1; phase casting|waiting; start =
+    -- os.time() epoch of the current cycle; ann60/ann30 = one-shot reminder flags.
+    -- ja_done = per-cycle one-shot flags for the global JAs; row_* track the
+    -- current row's per-row JAs. NO timer monitoring -- the playlist toggles alone
+    -- decide what is attempted; a JA on cooldown is simply ignored by the game and
+    -- the cycle moves on.
+    cycle = {
+        idx = 1, phase = 'casting', start = os.time(), ann60 = false, ann30 = false,
+        ja_done = { soul_voice = false, nightingale = false, troubadour = false, clarion = false },
+        row_idx = 0, row_marcato = false, row_pianissimo = false,
+    },
+    buf = {
+        character  = {''},
+        song_input = {''},
+        pl_save    = {''},
+        pl_idx     = {0},
+        last_pl    = nil,
+        -- OPT: persistent single-element mirrors for the static checkboxes below,
+        -- reused every frame instead of `local ref = {b.X}` allocating a fresh
+        -- table on each of the ~7 checkboxes every frame the window is open.
+        -- Value is re-synced from config.brd on every render call (not just on
+        -- reseed), so an external change -- /sync brd nightingale off, etc. --
+        -- while the window is open still shows correctly; only the table itself
+        -- is reused, never the value.
+        sing_ref        = {false},
+        nightingale_ref = {false},
+        troubadour_ref  = {false},
+        soul_voice_ref  = {false},
+        clarion_ref     = {false},
+        announce_ref    = {false},
+        engagelock_ref  = {false},
+        -- OPT: lazily-created per-row buffer set, keyed by song NAME (stable
+        -- across move up/down, unlike row index). See geo_mod.brd.row_buf.
+        row = {},
+    },
+}
+-- Song id -> name (verbatim from Singer sing_get). Drives /sync brd add fuzzy
+-- resolve and cycle song-name validation.
+geo_mod.brd.song = {
+
+    [368] = 'Foe Requiem',          [369] = 'Foe Requiem II',       [370] = 'Foe Requiem III',
+    [371] = 'Foe Requiem IV',       [372] = 'Foe Requiem V',        [373] = 'Foe Requiem VI',
+    [374] = 'Foe Requiem VII',      [375] = 'Foe Requiem VIII',     [376] = 'Horde Lullaby',
+    [377] = 'Horde Lullaby II',     [378] = 'Army\'s Paeon',        [379] = 'Army\'s Paeon II',
+    [380] = 'Army\'s Paeon III',    [381] = 'Army\'s Paeon IV',     [382] = 'Army\'s Paeon V',
+    [383] = 'Army\'s Paeon VI',     [384] = 'Army\'s Paeon VII',    [385] = 'Army\'s Paeon VIII',
+    [386] = 'Mage\'s Ballad',       [387] = 'Mage\'s Ballad II',    [388] = 'Mage\'s Ballad III',
+    [389] = 'Knight\'s Minne',      [390] = 'Knight\'s Minne II',   [391] = 'Knight\'s Minne III',
+    [392] = 'Knight\'s Minne IV',   [393] = 'Knight\'s Minne V',    [394] = 'Valor Minuet',
+    [395] = 'Valor Minuet II',      [396] = 'Valor Minuet III',     [397] = 'Valor Minuet IV',
+    [398] = 'Valor Minuet V',       [399] = 'Sword Madrigal',       [400] = 'Blade Madrigal',
+    [401] = 'Hunter\'s Prelude',    [402] = 'Archer\'s Prelude',    [403] = 'Sheepfoe Mambo',
+    [404] = 'Dragonfoe Mambo',      [405] = 'Fowl Aubade',          [406] = 'Herb Pastoral',
+    [407] = 'Chocobo Hum',          [408] = 'Shining Fantasia',     [409] = 'Scop\'s Operetta',
+    [410] = 'Puppet\'s Operetta',   [411] = 'Jester\'s Operetta',   [412] = 'Gold Capriccio',
+    [413] = 'Devotee Serenade',     [414] = 'Warding Round',        [415] = 'Goblin Gavotte',
+    [416] = 'Cactuar Fugue',        [417] = 'Honor March',          [418] = 'Aria of Passion',
+    [419] = 'Advancing March',      [420] = 'Victory March',        [421] = 'Battlefield Elegy',
+    [422] = 'Carnage Elegy',        [423] = 'Massacre Elegy',       [424] = 'Sinewy Etude',
+    [425] = 'Dextrous Etude',       [426] = 'Vivacious Etude',      [427] = 'Quick Etude',
+    [428] = 'Learned Etude',        [429] = 'Spirited Etude',       [430] = 'Enchanting Etude',
+    [431] = 'Herculean Etude',      [432] = 'Uncanny Etude',        [433] = 'Vital Etude',
+    [434] = 'Swift Etude',          [435] = 'Sage Etude',           [436] = 'Logical Etude',
+    [437] = 'Bewitching Etude',     [438] = 'Fire Carol',           [439] = 'Ice Carol',
+    [440] = 'Wind Carol',           [441] = 'Earth Carol',          [442] = 'Lightning Carol',
+    [443] = 'Water Carol',          [444] = 'Light Carol',          [445] = 'Dark Carol',
+    [446] = 'Fire Carol II',        [447] = 'Ice Carol II',         [448] = 'Wind Carol II',
+    [449] = 'Earth Carol II',       [450] = 'Lightning Carol II',   [451] = 'Water Carol II',
+    [452] = 'Light Carol II',       [453] = 'Dark Carol II',        [454] = 'Fire Threnody',
+    [455] = 'Ice Threnody',         [456] = 'Wind Threnody',        [457] = 'Earth Threnody',
+    [458] = 'Ltng. Threnody',       [459] = 'Water Threnody',       [460] = 'Light Threnody',
+    [461] = 'Dark Threnody',        [462] = 'Magic Finale',         [463] = 'Foe Lullaby',
+    [464] = 'Goddess\'s Hymnus',    [465] = 'Chocobo Mazurka',      [466] = 'Maiden\'s Virelai',
+    [467] = 'Raptor Mazurka',       [468] = 'Foe Sirvente',         [469] = 'Adventurer\'s Dirge',
+    [470] = 'Sentinel\'s Scherzo',  [471] = 'Foe Lullaby II',       [472] = 'Pining Nocturne',
+    [871] = 'Fire Threnody II',     [872] = 'Ice Threnody II',      [873] = 'Wind Threnody II',
+    [874] = 'Earth Threnody II',    [875] = 'Ltng. Threnody II',    [876] = 'Water Threnody II',
+    [877] = 'Light Threnody II',    [878] = 'Dark Threnody II',
+}
+-- OPT: reverse lookup (normalized name -> canonical name), built once so
+-- song_valid/song_from_command are O(1) instead of re-lowercasing and
+-- linear-scanning this ~110-entry dictionary on every cycle/command call.
+-- Keyed by the fully-normalized form (whitespace/punctuation stripped,
+-- lowercased) -- strictly more aggressive than song_valid's plain :lower(),
+-- and safe to share since no two canonical names collide once normalized.
+geo_mod.brd.song_lookup = {}
+for _, name in pairs(geo_mod.brd.song) do
+    geo_mod.brd.song_lookup[(name:gsub('[%s%p]', '')):lower()] = name
 end
 
 ------------------------------------------------------------
@@ -271,7 +429,7 @@ end
 -- ENGAGE RETRY
 ------------------------------------------------------------
 local function queue_retry(c, cmd, now)
-    c.retry = { cmd = cmd, time = now + RETRY_DELAY, is_attack = cmd:find('/attack', 1, true) ~= nil }
+    c.retry = { cmd = cmd, time = now + TIMING.retry, is_attack = cmd:find('/attack', 1, true) ~= nil }
 end
 
 local function process_retry(c, now, party, ent)
@@ -473,6 +631,23 @@ local default_settings = T{
                regen     = T{ enabled = false, recast = 90,  spell = 'Regen IV'  },
            } },
     },
+    -- Combat / hunt persistence. radius = yalm acquisition radius (squared at
+    -- use). lists[name_lower] = T{ 'Mob Name', ... }; an empty/absent list means
+    -- that box hunts ANY valid mob in radius (pack-hunting picks distinct mobs).
+    combat = T{
+        radius  = 12.0,
+        yaw_off = 0.0,
+        camp_x  = 0.0, camp_y = 0.0, camp_set = false,
+        lists   = T{},
+        pull    = T{},   -- [name_lower] = pull command string ('' = none)
+        rdm_dia = '/ma "Dia III" <t>',  -- RDM hunt-mode debuff cycled across mobs
+        blacklist = T{},  -- mob names never hunted by any box
+        pull_dist   = T{},   -- [name_lower] = yalms; box fires its pull only within this range (default 20.0)
+        fight_range = T{},   -- [name_lower] = yalms leash from the engaged mob; box closes distance if it
+                              -- drifts beyond this (default 3.5; max 4.9 for Taru melee range)
+        huntmode    = T{},    -- per-box: 0=off 1=hunt(distinct) 2=converge(same mob)
+        retmode     = T{},    -- per-box camp return: 0=off 1=on-claim 2=on-death
+    },
     -- GEO scheduler config. character = '' disables the entire block (zero work
     -- in the logic loop). Durations are user-specified (no equipment parsing);
     -- recast jitter fires the spell randomly between (duration - recast_max)
@@ -516,8 +691,70 @@ local default_settings = T{
                bog=false, ea=false, demat=true },
         },
     },
+    -- BRD box assignment. BRD (Bard song cycle) -- Singer folded in; the
+    -- standalone addon is no longer loaded. Full playlist + JA toggles + named
+    -- playlists live here so they persist through sync's own settings.
+    -- character names the bard box; songs/JAs are forwarded to it via /mst
+    -- (sync runs on the main only, so the bard is driven entirely remotely).
+    brd = T{
+        character        = '',
+        sing             = false,
+        nightingale      = true,
+        troubadour       = true,
+        soul_voice       = false,
+        clarion          = false,
+        delay            = 2.0,
+        interval         = 240,
+        announce         = true,
+        engagelock       = false,
+        debug            = false,
+        playlists        = T{},
+        current_playlist = '',
+        songs            = T{},
+    },
 }
 local config = settings.load(default_settings)
+if not config.combat then config.combat = T{ radius = 12.0, lists = T{} } end
+if not config.combat.lists then config.combat.lists = T{} end
+if not config.combat.pull  then config.combat.pull  = T{} end
+if config.combat.rdm_dia == nil then config.combat.rdm_dia = '/ma "Dia III" <t>' end
+if not config.combat.blacklist then config.combat.blacklist = T{} end
+-- pull_dist / fight_range MIGRATION: older saved configs had these as a single
+-- global number. Per-character control replaces that; the old global value (if
+-- present) becomes nobody's setting -- defaults (20.0 / 3.5) apply per-box until
+-- the user dials each box in individually via the Combat panel.
+if type(config.combat.pull_dist) ~= 'table' then config.combat.pull_dist = T{} end
+if type(config.combat.fight_range) ~= 'table' then config.combat.fight_range = T{} end
+if not config.combat.retmode then config.combat.retmode = T{} end
+if not config.combat.huntmode   then config.combat.huntmode   = T{} end
+if config.combat.camp_set == nil then config.combat.camp_set = false end
+if not config.brd then config.brd = T{ character = '' } end
+if config.brd.character == nil then config.brd.character = '' end
+do
+    -- BRD field defaulting + entry migration (mirrors Singer load-time pass).
+    -- No `local` here -- the main chunk sits exactly at the 200-local ceiling.
+    if config.brd.sing        == nil then config.brd.sing        = false end
+    if config.brd.nightingale == nil then config.brd.nightingale = true  end
+    if config.brd.troubadour  == nil then config.brd.troubadour  = true  end
+    if config.brd.soul_voice  == nil then config.brd.soul_voice  = false end
+    if config.brd.clarion     == nil then config.brd.clarion     = false end
+    if config.brd.delay       == nil then config.brd.delay       = 2.0   end
+    if config.brd.interval    == nil then config.brd.interval    = 240   end
+    if config.brd.announce    == nil then config.brd.announce    = true  end
+    if config.brd.engagelock  == nil then config.brd.engagelock  = false end
+    if config.brd.debug       == nil then config.brd.debug       = false end
+    if not config.brd.playlists then config.brd.playlists = T{} end
+    if config.brd.current_playlist == nil then config.brd.current_playlist = '' end
+    if not config.brd.songs then config.brd.songs = T{} end
+    for _, e in ipairs(config.brd.songs) do
+        if e.enabled    == nil then e.enabled    = true  end
+        if e.marcato    == nil then e.marcato    = false end
+        if e.pianissimo == nil then e.pianissimo = false end
+        if e.target     == nil then e.target     = ''    end
+    end
+end
+hunt_mod.radius_buf[1] = config.combat.radius or 12.0
+hunt_mod.yaw_off = config.combat.yaw_off or 0.0
 
 -- Apply persisted crew names BEFORE per-char state is derived below.
 for i = 1, #chars do
@@ -1276,6 +1513,16 @@ local function reset_list_combat(list)
         e.solace_lock        = 0
         e.larts_lock         = 0
         e.addw_lock          = 0
+        -- Hunt/movement state: must be cleared on zone so entity indices from the
+        -- previous zone don't suppress pulls or keep stale run_active blocking follow.
+        -- (hunt_pulled in particular: if a mob in the new zone lands on the same
+        -- entity index as the old target, the pull would be silently skipped forever.)
+        e.hunt_engaged  = false
+        e.hunt_assigned = 0
+        e.hunt_pulled   = nil
+        e.hunt_prev_mob = nil
+        e.run_active    = false
+        e.run_idx       = nil
     end
 end
 
@@ -1467,6 +1714,610 @@ local lastTick, lastScanTick = 0, 0
 local is_zoning_prev = false
 local rdm_buff_idle_until = 0
 
+------------------------------------------------------------
+-- COMBAT / HUNT ENGINE
+------------------------------------------------------------
+-- All hunt helpers hang off hunt_mod (table fields, not locals) so they add
+-- ZERO to the main chunk's 200-local budget. Call as hunt_mod.run(...) etc.
+
+-- per-box mob whitelist (created lazily). Empty list => hunt ANY valid mob.
+function hunt_mod.list(c)
+    local L = config.combat.lists[c.name_lower]
+    if not L then L = T{}; config.combat.lists[c.name_lower] = L end
+    return L
+end
+
+function hunt_mod.pull_cmd(c)
+    return config.combat.pull[c.name_lower] or ''
+end
+
+-- Fire a one-shot pull action at the assigned mob to draw it into range. Main
+-- targets locally then runs the command; alts route through rdmhelper's 'exec'
+-- (SetTarget idx + run command). The command should use <t> (e.g. /ma "Dia III"
+-- <t>, /ra <t>, /ja "Sic" <t>).
+function hunt_mod.do_pull(c, idx, cmd)
+    if c.is_main then
+        local tm = mm:GetTarget()
+        if tm then pcall(function() tm:SetTarget(idx, false) end) end
+        chat:QueueCommand(1, cmd)
+    else
+        qcmd(c.mst_prefix .. '/rdmhelper exec ' .. idx .. ' ' .. cmd)
+    end
+end
+
+-- RUN-TO-MOB / CAMPSITE (experimental movement). Uses the AutoFollow run state
+-- (Bambooya's primitive): set the follow delta to the unit direction and turn on
+-- auto-running; the client runs (and turns) that way. Alts move via rdmhelper;
+-- the main moves here. Stops within ~2y, with a hard timeout. Movement suppresses
+-- follow for that box (see want_follow gate) so the two don't fight.
+function hunt_mod.runto(c, idx)
+    if c.is_main then return end
+    local fr = hunt_mod.fight_range(c)
+    qcmd(c.mst_prefix .. '/rdmhelper runto ' .. idx .. ' ' .. string.format('%.4f', fr * fr))
+    c.run_active = true
+end
+
+function hunt_mod.stoprun(c)
+    if c.is_main then return end
+    qcmd(c.mst_prefix .. '/rdmhelper stoprun')
+    c.run_active = false
+end
+
+-- Send an alt back to the saved campsite (point-move; the helper auto-stops on
+-- arrival). Used by the per-box return modes.
+function hunt_mod.goto_camp(c)
+    if c.is_main or not config.combat.camp_set then return end
+    qcmd(c.mst_prefix .. '/rdmhelper goto ' ..
+         string.format('%.2f %.2f', config.combat.camp_x or 0, config.combat.camp_y or 0))
+    c.run_active = true
+end
+
+function hunt_mod.camp_set()
+    local me = GetPlayerEntity()
+    if not me then print('[sync] camp: no player entity'); return end
+    local p = me.Movement.LocalPosition
+    config.combat.camp_x, config.combat.camp_y = p.X, p.Y
+    config.combat.camp_set = true
+    settings.save()
+    print(string.format('[sync] campsite set: %.1f, %.1f', p.X, p.Y))
+end
+
+function hunt_mod.camp_go()
+    if not config.combat.camp_set then print('[sync] camp not set (use /sync camp set)'); return end
+    local cx, cy = config.combat.camp_x, config.combat.camp_y
+    for _, c in ipairs(chars) do
+        if c.in_zone then
+            if c.is_main then
+                local g = hunt_mod.main_goto
+                g.x, g.y, g.active, g.deadline = cx, cy, true, os_clock() + 30.0
+            else
+                qcmd(c.mst_prefix .. '/rdmhelper goto ' .. string.format('%.2f %.2f', cx, cy))
+            end
+        end
+    end
+    print('[sync] returning crew to campsite')
+end
+
+-- Main campsite move tick (called each logic loop). Runs the main toward the
+-- saved point until within ~2y or the deadline.
+function hunt_mod.main_move_tick(now)
+    local g = hunt_mod.main_goto
+    if not g.active then return end
+    local af = mm:GetAutoFollow()
+    if now > g.deadline then g.active = false; if af then af:SetIsAutoRunning(0) end; return end
+    local me = GetPlayerEntity()
+    if not me or not af then return end
+    local sp = me.Movement.LocalPosition
+    local dx, dy = g.x - sp.X, g.y - sp.Y
+    local d2 = dx*dx + dy*dy
+    if d2 <= 4.0 then af:SetIsAutoRunning(0); g.active = false; return end
+    local d = math.sqrt(d2)
+    af:SetFollowDeltaX(dx / d); af:SetFollowDeltaY(dy / d); af:SetFollowDeltaZ(0)
+    af:SetIsAutoRunning(1)
+end
+
+function hunt_mod.in_list(L, nm)
+    if not L or #L == 0 then return true end  -- empty list = any mob
+    local n = hunt_mod.norm(nm)
+    for i = 1, #L do if hunt_mod.norm(L[i]) == n then return true end end
+    return false
+end
+
+-- A live, attackable, in-radius mob whose claim is free or held by crew.
+-- Returns the entity name (for whitelist matching) or nil.
+-- Global blacklist: a mob name here is NEVER hunted by any box.
+-- Normalize a mob name for matching: lowercase, curly-apostrophe -> ', trim.
+-- FFXI names and typed entries can differ on apostrophe glyph / spacing, which
+-- silently broke exact matches (e.g. Demon's Elemental).
+function hunt_mod.norm(str)
+    str = (str or ''):lower()
+    str = str:gsub('\226\128\152', "'"):gsub('\226\128\153', "'")
+    str = str:gsub('^%s+', ''):gsub('%s+$', '')
+    return str
+end
+
+function hunt_mod.blacklisted(nm)
+    local B = config.combat.blacklist
+    if not B or #B == 0 then return false end
+    local n = hunt_mod.norm(nm)
+    for i = 1, #B do
+        local e = hunt_mod.norm(B[i])
+        if e ~= '' and n:find(e, 1, true) then return true end  -- substring, plain
+    end
+    return false
+end
+
+-- A live, attackable mob whose claim is free or held by crew, not blacklisted.
+-- Distance is NOT checked here -- it's gated per-hunter in the assignment, since
+-- ent:GetDistance is anchored on the MAIN and alts can be far from it.
+function hunt_mod.valid(ent, idx)
+    if idx == 0 then return nil end
+    local spawn = ent:GetSpawnFlags(idx) or 0
+    if bit_band(spawn, 0x10) == 0 then return nil end      -- not a mob
+    if bit_band(spawn, 0x01) ~= 0 then return nil end      -- a PC (player/trust)
+    if (ent:GetHPPercent(idx) or 0) <= 0 then return nil end
+    local claim = bit_band(ent:GetClaimStatus(idx) or 0, 0xFFFF)
+    if claim ~= 0 and not hunt_mod.crew_mask[claim] then return nil end
+    local nm = ent:GetName(idx)
+    if not nm or nm == '' or nm == 'Unknown' then return nil end
+    if hunt_mod.blacklisted(nm) then return nil end
+    return nm
+end
+
+-- Ground-plane (X/Y) position of a hunting box. Main via GetPlayerEntity();
+-- alts resolved by name into the entity array (cached on c.hunt_eidx, throttled
+-- re-resolve). Returns hx, hy or nil if unresolved.
+function hunt_mod.box_pos(ent, c, now)
+    if c.is_main then
+        local me = GetPlayerEntity()
+        if not me then return nil end
+        local p = me.Movement.LocalPosition
+        return p.X, p.Y
+    end
+    local ei = c.hunt_eidx or 0
+    if ei == 0 or (ent:GetName(ei) or ''):lower() ~= c.name_lower then
+        if now - (c.hunt_eidx_t or 0) >= 1.0 then
+            c.hunt_eidx_t = now
+            ei = 0
+            for k = 0, 0x8FF do
+                local n = ent:GetName(k)
+                if n and n:lower() == c.name_lower then ei = k; break end
+            end
+            c.hunt_eidx = ei
+        else
+            ei = c.hunt_eidx or 0
+        end
+        if ei == 0 then return nil end
+    end
+    return ent:GetLocalPositionX(ei) or 0, ent:GetLocalPositionY(ei) or 0
+end
+
+-- Tell a box to attack a specific entity index. The main acts locally; other
+-- boxes route through rdmhelper (SetTarget + /attack on).
+function hunt_mod.attack(c, idx)
+    if c.is_main then
+        local tm = mm:GetTarget()
+        if tm then pcall(function() tm:SetTarget(idx, false) end) end
+        chat:QueueCommand(1, '/attack on')
+    else
+        qcmd(c.mst_prefix .. '/rdmhelper hunt ' .. idx)
+    end
+end
+
+function hunt_mod.disengage(c)
+    if c.is_main then chat:QueueCommand(1, '/attack off')
+    else qcmd(c.mst_prefix .. '/attack off') end
+end
+
+hunt_mod.RESEND  = 4.0   -- re-issue an unchanged assignment at most this often
+hunt_mod.CMD_GAP = 0.5   -- min spacing between hunt commands to one box
+hunt_mod.ENGAGE_DIST2 = 100.0   -- 10y, squared -- box must close to this before /attack on fires
+
+-- Per-character pull distance / fight (leash) range. Both default if the box
+-- hasn't been dialed in yet via the Combat panel.
+function hunt_mod.pull_dist(c)
+    return config.combat.pull_dist[c.name_lower] or 20.0
+end
+function hunt_mod.fight_range(c)
+    return config.combat.fight_range[c.name_lower] or 3.5
+end
+
+-- Full hunt pass: rebuild candidate pool (gated), then sticky -> distinct ->
+-- highest-HP shared assignment over all hunting boxes.
+function hunt_mod.run(party, ent, player, now)
+    table.clear(hunt_mod.crew_mask)
+    local hunters, hn = nil, 0
+    for _, c in ipairs(chars) do
+        if c.in_zone and c.pt_data then
+            hunt_mod.crew_mask[bit_band(c.pt_data.sId, 0xFFFF)] = true
+            local hm = config.combat.huntmode[c.name_lower] or 0
+            c.hunt[1]   = (hm > 0)     -- keep bool in sync for any code that reads it
+            c.hunt_conv = (hm == 2)    -- converge mode: all boxes focus the same mob
+            if hm > 0 then
+                hunters = hunters or {}
+                hn = hn + 1; hunters[hn] = c
+            end
+        end
+    end
+
+    hunt_mod.eng_n = 0
+    if hn == 0 then
+        for _, c in ipairs(chars) do
+            if c.hunt_engaged then hunt_mod.disengage(c); c.hunt_engaged = false; c.hunt_assigned = 0; c.hunt_pulled = nil end
+            if c.run_active   then hunt_mod.stoprun(c);   c.run_idx = nil end
+        end
+        return
+    end
+
+    local radius = (config.combat.radius or 12.0)
+    local r2 = radius * radius
+
+    -- Clear movement state for any box that just left the hunt roster (hunt toggled
+    -- off while the box was mid-runto). The hn==0 early return handles the all-off
+    -- case; this sweep catches individual boxes when at least one box is still hunting.
+    for _, c in ipairs(chars) do
+        if not c.hunt[1] and c.run_active then
+            hunt_mod.stoprun(c); c.run_idx = nil
+        end
+    end
+
+    -- resolve each hunter's ground position (for per-hunter distance gating)
+    for i = 1, hn do
+        local c = hunters[i]
+        c._hx, c._hy = hunt_mod.box_pos(ent, c, now)
+    end
+
+    -- 1. CANDIDATE REBUILD (gated): store mob positions, not main-distance.
+    if now >= hunt_mod.next_scan then
+        hunt_mod.next_scan = now + hunt_mod.scan_gap
+        local cand, cn = hunt_mod.cand, 0
+        local hp  = hunt_mod.cand_hp
+        local nmc = hunt_mod.cand_name or {}; hunt_mod.cand_name = nmc
+        local cx  = hunt_mod.cand_x or {};    hunt_mod.cand_x = cx
+        local cy  = hunt_mod.cand_y or {};    hunt_mod.cand_y = cy
+        table.clear(hp); table.clear(nmc); table.clear(cx); table.clear(cy)
+        for idx = hunt_mod.mob_lo, hunt_mod.mob_hi do
+            local nm = hunt_mod.valid(ent, idx)
+            if nm then
+                cn = cn + 1; cand[cn] = idx
+                hp[idx]  = ent:GetHPPercent(idx) or 0
+                nmc[idx] = nm
+                cx[idx]  = ent:GetLocalPositionX(idx) or 0
+                cy[idx]  = ent:GetLocalPositionY(idx) or 0
+            end
+        end
+        for i = #cand, cn + 1, -1 do cand[i] = nil end
+    end
+
+    local cand, hp, nmc = hunt_mod.cand, hunt_mod.cand_hp, hunt_mod.cand_name
+    local cx, cy = hunt_mod.cand_x, hunt_mod.cand_y
+    local taken = hunt_mod.taken; table.clear(taken)
+
+    -- 2. STICKY: keep current target if it's a valid whitelist mob. When already
+    --    engaged we skip the radius gate: a mob that momentarily drifts past the
+    --    radius edge mid-fight should NOT abort the engagement. Radius is re-enforced
+    --    once the mob dies and a fresh assignment is needed.
+    for i = 1, hn do
+        local c = hunters[i]; c._assign = 0
+        local cur = c.is_main and get_target_index(mm:GetTarget())
+                    or party:GetMemberTargetIndex(c.pt_data.index)
+        if cur and cur > 0 and not taken[cur] and c._hx then
+            local nm = hunt_mod.valid(ent, cur)
+            if nm and hunt_mod.in_list(hunt_mod.list(c), nm) then
+                if c.hunt_engaged then
+                    -- committed: mob is alive and whitelisted; hold it
+                    c._assign = cur; taken[cur] = true
+                else
+                    local dx = (ent:GetLocalPositionX(cur) or 0) - c._hx
+                    local dy = (ent:GetLocalPositionY(cur) or 0) - c._hy
+                    if dx*dx + dy*dy <= r2 then c._assign = cur; taken[cur] = true end
+                end
+            end
+        end
+    end
+
+    -- 3. DISTINCT (Hunt mode): idle HUNT hunters take the nearest free in-radius
+    --    whitelist mob. Live entity positions are used here instead of the cached
+    --    cx/cy from the scan: stale scan positions (up to scan_gap old) caused boxes
+    --    to be assigned to mobs that had already walked outside the radius.
+    for i = 1, hn do
+        local c = hunters[i]
+        if c._assign == 0 and c._hx and not c.hunt_conv then
+            local L = hunt_mod.list(c)
+            local best, bestd = 0, r2
+            for k = 1, #cand do
+                local idx = cand[k]
+                if not taken[idx] and hunt_mod.in_list(L, nmc[idx] or '') then
+                    if (ent:GetHPPercent(idx) or 0) > 0 then
+                        local mx = ent:GetLocalPositionX(idx) or 0
+                        local my = ent:GetLocalPositionY(idx) or 0
+                        local dx, dy = mx - c._hx, my - c._hy
+                        local d = dx*dx + dy*dy
+                        if d <= bestd then best, bestd = idx, d end
+                    end
+                end
+            end
+            if best ~= 0 then c._assign = best; taken[best] = true end
+        end
+    end
+
+    -- 3b. CONVERGE: all converge-mode boxes focus the same highest-HP in-radius
+    --     mob (live positions). The mob is chosen relative to the first converge
+    --     box with a resolved position and is NOT marked taken, so Hunt boxes
+    --     remain fully independent.
+    local converge_idx = 0
+    do
+        local chx, chy = nil, nil
+        for i = 1, hn do
+            if hunters[i].hunt_conv and hunters[i]._hx then
+                chx, chy = hunters[i]._hx, hunters[i]._hy; break
+            end
+        end
+        if chx then
+            local besthp = -1
+            for k = 1, #cand do
+                local idx = cand[k]
+                if (ent:GetHPPercent(idx) or 0) > 0 then
+                    local mx = ent:GetLocalPositionX(idx) or 0
+                    local my = ent:GetLocalPositionY(idx) or 0
+                    local dx, dy = mx - chx, my - chy
+                    if dx*dx + dy*dy <= r2 then
+                        local h = hp[idx] or 0
+                        if h > besthp then converge_idx = idx; besthp = h end
+                    end
+                end
+            end
+        end
+    end
+    for i = 1, hn do
+        local c = hunters[i]
+        if c._assign == 0 and c.hunt_conv then
+            c._assign = converge_idx   -- shared target; no taken mark
+        end
+    end
+
+    -- 4. SHARED FALLBACK: highest-HP taken mob within this hunter's radius
+    --    (live positions for same reason as step 3).
+    for i = 1, hn do
+        local c = hunters[i]
+        if c._assign == 0 and c._hx then
+            local L, best, besthp = hunt_mod.list(c), 0, -1
+            for idx in pairs(taken) do
+                if hunt_mod.in_list(L, nmc[idx] or '') then
+                    local mx = ent:GetLocalPositionX(idx) or 0
+                    local my = ent:GetLocalPositionY(idx) or 0
+                    local dx, dy = mx - c._hx, my - c._hy
+                    if dx*dx + dy*dy <= r2 then
+                        local h = hp[idx] or 0
+                        if h > besthp then best, besthp = idx, h end
+                    end
+                end
+            end
+            if best ~= 0 then c._assign = best end
+        end
+    end
+
+    -- 5. DISPATCH + engaged union (RDM multi-target debuffing reads this)
+    local eng, en = hunt_mod.engaged, 0
+    for i = 1, hn do
+        local c = hunters[i]; local idx = c._assign
+        local rm = config.combat.retmode[c.name_lower] or 0
+        local camp_ok = config.combat.camp_set and not c.is_main
+        local prev = c.hunt_prev_mob
+
+        -- DEATH-return: if this box's previous mob just died, open a return-to-
+        -- camp window so it heads home before the next pull.
+        if rm == 2 and prev and prev ~= idx and (ent:GetHPPercent(prev) or 0) <= 0 and camp_ok then
+            c.camp_until = now + 10.0
+        end
+
+        if idx ~= 0 then
+            en = en + 1; eng[en] = idx
+
+            -- mob's ground position relative to this hunter, used by every distance
+            -- gate below (engage range, pull range, leash range, camp-claim range).
+            local mx = ent:GetLocalPositionX(idx) or 0
+            local my = ent:GetLocalPositionY(idx) or 0
+            local mdx = mx - (c._hx or mx)
+            local mdy = my - (c._hy or my)
+            local mdist2 = c._hx and (mdx * mdx + mdy * mdy) or nil
+
+            -- `changed` tracks the assignment edge (true only on the tick a NEW mob
+            -- is acquired) for the pull gate below. hunt_assigned is updated
+            -- unconditionally every tick so this stays a true one-tick edge even
+            -- though actual /attack on issuance is now gated by engage range
+            -- (see in_engage_range) and may lag several ticks behind assignment.
+            local changed = (c.hunt_assigned ~= idx)
+            c.hunt_assigned = idx
+
+            -- ENGAGE GATE: don't draw weapon / commit to melee until within 10y.
+            -- Hunt-mode boxes used to /attack on the instant a mob was assigned,
+            -- from any distance -- weapon out, running, swinging at air the whole
+            -- approach and broadcasting aggro early. Movement (below) still closes
+            -- the gap regardless of this gate; only the actual engage command waits.
+            local in_engage_range = mdist2 and mdist2 <= hunt_mod.ENGAGE_DIST2
+            if in_engage_range then
+                local curtgt = c.is_main and get_target_index(mm:GetTarget())
+                               or party:GetMemberTargetIndex(c.pt_data.index)
+                local wrong = (curtgt ~= idx)
+                local stale = (now - (c.hunt_last_cmd or 0) >= hunt_mod.RESEND)
+                if (not c.hunt_engaged or wrong or stale) and (now - (c.hunt_last_cmd or 0) >= hunt_mod.CMD_GAP) then
+                    hunt_mod.attack(c, idx)
+                    c.hunt_last_cmd = now; c.hunt_engaged = true
+                end
+            end
+
+            -- pull: fire once, only when within THIS box's pull distance of the
+            -- mob. Per-character range (hunt_mod.pull_dist) since different pull
+            -- actions (ranged shot vs. a Dia cast vs. a melee Provoke) have very
+            -- different practical reach. Guard `not changed`: deferring the pull
+            -- to the tick AFTER assignment avoids racing the attack command at
+            -- rdmhelper (see longer note in prior revisions).
+            local pc = hunt_mod.pull_cmd(c)
+            if pc ~= '' and c.hunt_pulled ~= idx and mdist2 and not changed then
+                local pd = hunt_mod.pull_dist(c)
+                if mdist2 <= pd * pd then
+                    hunt_mod.do_pull(c, idx, pc)
+                    c.hunt_pulled = idx
+                end
+            end
+
+            -- MOVEMENT. Camp-return (claim mode once the mob is close, or an
+            -- active post-death window) takes priority over everything else.
+            -- Otherwise: LEASH -- keep this box within its own configured
+            -- fight_range of the mob at all times while assigned. This is what
+            -- stops a box from ending up out of melee/WS range (terrain, model
+            -- hitbox, knockback, whatever) while the mob can still reach IT.
+            -- Movement is enabled whenever the box has no pull command (nothing
+            -- else would ever close the gap) or the Run checkbox is explicitly on;
+            -- a mage sitting at range with a pull spell configured and Run off
+            -- simply never triggers this -- exactly the "stay out of range" case.
+            local mob_near = mdist2 and mdist2 <= 36.0  -- within 6y, for Ret:Claim
+            local want_camp = camp_ok and ((rm == 1 and mob_near) or (now < (c.camp_until or 0)))
+            if want_camp then
+                if c.run_idx ~= 'camp' or (now - (c.run_last or 0) >= 4.0) then
+                    hunt_mod.goto_camp(c); c.run_idx = 'camp'; c.run_last = now
+                end
+            elseif not c.is_main and mdist2 and ((c.runto and c.runto[1]) or pc == '') then
+                local fr = hunt_mod.fight_range(c)
+                if mdist2 > fr * fr then
+                    if c.run_idx ~= idx or (now - (c.run_last or 0) >= 4.0) then
+                        hunt_mod.runto(c, idx); c.run_idx = idx; c.run_last = now
+                    end
+                elseif c.run_active and c.run_idx == idx then
+                    hunt_mod.stoprun(c); c.run_idx = nil   -- back within leash range; stop
+                end
+            elseif c.run_active then
+                hunt_mod.stoprun(c); c.run_idx = nil
+            end
+            c.hunt_prev_mob = idx
+        else
+            -- no assignment: keep heading home if a death window is open.
+            if camp_ok and now < (c.camp_until or 0) then
+                if c.run_idx ~= 'camp' or (now - (c.run_last or 0) >= 4.0) then
+                    hunt_mod.goto_camp(c); c.run_idx = 'camp'; c.run_last = now
+                end
+            elseif c.run_active then
+                -- Stop any in-progress run (mob dead, no camp window). Without this,
+                -- a box that arrived at camp (run_idx='camp') would keep run_active=true
+                -- and suppress follow indefinitely.
+                hunt_mod.stoprun(c); c.run_idx = nil
+            end
+            if c.hunt_engaged then
+                hunt_mod.disengage(c); c.hunt_engaged = false; c.hunt_assigned = 0; c.hunt_pulled = nil
+            end
+            c.hunt_prev_mob = nil
+        end
+    end
+    hunt_mod.eng_n = en
+
+    for idx in pairs(hunt_mod.diaed) do
+        local live = false
+        for i = 1, en do if eng[i] == idx then live = true; break end end
+        if not live then hunt_mod.diaed[idx] = nil end
+    end
+end
+
+-- FACE-LOCK dispatch: alts toggle helper-side facing (edge-triggered); the MAIN
+-- runs sync not the helper, so its facing is driven by hunt_mod.face_main.
+function hunt_mod.facelock(now)
+    for _, c in ipairs(chars) do
+        local want = c.face[1] and c.in_zone or false
+        if c.is_main then
+            hunt_mod.main_face = want
+        elseif want ~= (c.face_sent or false) then
+            if want then
+                qcmd(c.mst_prefix .. '/rdmhelper face on ' .. string.format('%.4f', hunt_mod.yaw_off or 0.0))
+            else
+                qcmd(c.mst_prefix .. '/rdmhelper face off')
+            end
+            c.face_sent = want
+        end
+    end
+end
+
+-- MAIN self-facing. Resolves the local player's entity index by matching
+-- MAIN self-facing. atom0s' method: the local player's RENDERED heading is the
+-- actor heading float at ActorPointer + 0x48 (LocalPosition.Yaw is input-driven
+-- and gets stomped each frame, which is why struct writes never held). Writing
+-- ptr+0x48 every frame turns the body with no camera lock. Direction is
+-- -atan2(dy, dx) over the X/Y ground plane (gnubeardo's 'facing'); yaw_off (from
+-- /sync faced) absorbs any residual convention. Gated on engaged status so it
+-- never fights follow-movement while the box is travelling to the main.
+function hunt_mod.face_main(party, ent, targ)
+    if not hunt_mod.main_face then return end
+    local cur = get_target_index(targ)
+    if cur == 0 then return end
+    local me = GetPlayerEntity()
+    if not me or me.Status ~= 1 then return end
+    local ptr = me.ActorPointer
+    if not ptr or ptr == 0 then return end
+    local tgt = GetEntity(cur)
+    if not tgt then return end
+    local sp, tp = me.Movement.LocalPosition, tgt.Movement.LocalPosition
+    local yaw = -(math.atan2 or math.atan)(tp.Y - sp.Y, tp.X - sp.X) + (hunt_mod.yaw_off or 0.0)
+    ashita.memory.write_float(ptr + 0x48, yaw)
+end
+
+-- FACE CALIBRATION: with face OFF, manually face a target, target it, run
+-- /sync faced. Reads the engine's actual actor heading (ptr+0x48) vs our computed
+-- -atan2(dy,dx); the normalized difference is stored as yaw_off and added to every
+-- facing write, absorbing this build's heading convention. /sync faced reset clears.
+function hunt_mod.calibrate(party, ent, targ, arg)
+    if arg == 'reset' or arg == '0' then
+        hunt_mod.yaw_off = 0.0
+        config.combat.yaw_off = 0.0
+        settings.save()
+        for _, c in ipairs(chars) do c.face_sent = nil end
+        print('[sync] face calibration reset (yaw_off = 0)')
+        return
+    end
+    local cur = get_target_index(targ)
+    if cur == 0 then print('[sync] /sync faced: target the mob you are FACING first (with Face OFF)'); return end
+    local me = GetPlayerEntity()
+    local tgt = GetEntity(cur)
+    if not me or not tgt then print('[sync] /sync faced: could not read player/target entity'); return end
+    local ptr = me.ActorPointer
+    if not ptr or ptr == 0 then print('[sync] /sync faced: no actor pointer'); return end
+    local sp, tp = me.Movement.LocalPosition, tgt.Movement.LocalPosition
+    local computed = -(math.atan2 or math.atan)(tp.Y - sp.Y, tp.X - sp.X)
+    local H = ashita.memory.read_float(ptr + 0x48)
+    local off = H - computed
+    while off >  math.pi do off = off - 2 * math.pi end
+    while off <= -math.pi do off = off + 2 * math.pi end
+    hunt_mod.yaw_off = off
+    config.combat.yaw_off = off
+    settings.save()
+    for _, c in ipairs(chars) do c.face_sent = nil end
+    print(string.format('[sync] face calibrated: engine=%.3f computed=%.3f -> yaw_off=%.3f (saved)', H, computed, off))
+end
+
+
+-- RDM hunt-mode debuff: pick the first crew-engaged mob not yet Dia'd and cast
+-- via the helper. Fires once per mob (cleared on death/disengage). Gated by the
+-- caller on rdm.action_lock. Returns true if a cast was issued.
+function hunt_mod.rdm_dia(rdm, ent, now)
+    local cmd = config.combat.rdm_dia or ''
+    if cmd == '' then return false end
+    local eng, n = hunt_mod.engaged, hunt_mod.eng_n
+    for i = 1, n do
+        local midx = eng[i]
+        if midx and midx > 0 and (ent:GetHPPercent(midx) or 0) > 5
+           and not hunt_mod.diaed[midx] then
+            -- Dia each engaged mob ONCE. diaed[idx] is cleared when the mob leaves
+            -- the engaged union (death/disengage), so a new mob at that index re-Dias.
+            -- route via exec so the raw command (quotes/aliases) reaches the box intact.
+            do_action(rdm, '/rdmhelper exec ' .. midx .. ' ' .. cmd, get_cast_delay('Dia III'), now)
+            hunt_mod.diaed[midx] = true
+            return true
+        end
+    end
+    return false
+end
+
+------------------------------------------------------------
+-- MAIN LOGIC LOOP
+------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function()
     local now = os_clock()
     if now - lastTick < TICK_ACTION then return end
@@ -1482,6 +2333,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         return
     elseif is_zoning_prev then
         reset_combat_flags()
+        config.combat.camp_set = false   -- camp position is zone-specific; force re-set
         guests = {}; debuff_queue = {}
         last_engage_target = 0
         is_zoning_prev = false
@@ -1513,6 +2365,30 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     if engageTarget ~= last_engage_target then
         debuff_queue = {}
         last_engage_target = engageTarget
+    end
+
+    -- COMBAT MODE: radius pack-hunting + face-lock. hunt_mod.run builds the engaged
+    -- union used below for RDM multi-target debuffing in hunt mode.
+    hunt_mod.run(party, ent, player, now)
+    hunt_mod.facelock(now)
+    hunt_mod.face_main(party, ent, targ)
+    hunt_mod.main_move_tick(now)
+
+    -- BLACKLIST ENFORCEMENT for the main: if the main has targeted a blacklisted
+    -- mob (via autotarget / Tab or any other means), immediately redirect to the
+    -- current hunt assignment or clear the target. Runs every tick so the game's
+    -- native autotarget can't hold a blacklisted mob for more than one frame.
+    if main_char and main_char.in_zone then
+        local bl_tg  = mm:GetTarget()
+        local bl_idx = get_target_index(bl_tg)
+        if bl_idx > 0 and bl_tg then
+            local bl_nm = ent and ent:GetName(bl_idx)
+            if bl_nm and hunt_mod.blacklisted(bl_nm) then
+                local next_idx = (main_char._assign and main_char._assign > 0)
+                                  and main_char._assign or 0
+                pcall(function() bl_tg:SetTarget(next_idx, false) end)
+            end
+        end
     end
 
     local rdm_in_zone = rdm and rdm.in_zone and rdm.pt_data
@@ -1591,7 +2467,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                 end
             end
             if pause and not rdm.debuff_pause then
-                rdm.action_lock = now + FOLLOW_SETTLE
+                rdm.action_lock = now + TIMING.settle
             end
             rdm.debuff_pause = pause
         end
@@ -1682,6 +2558,14 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         end
 
         if rdm.low_mp_mode then goto SKIP_RDM_BUFF end
+
+        -- HUNT MODE: cycle Dia III across every crew-engaged mob (logic in
+        -- hunt_mod.rdm_dia so logic_loop gains no locals). Returns true when it
+        -- fired a cast this tick; falls through to the single-target queue when
+        -- no hunt is active.
+        if rdm.deb[1] and hunt_mod.eng_n > 0 and hunt_mod.rdm_dia(rdm, ent, now) then
+            goto SKIP_RDM_BUFF
+        end
 
         if rdm.deb[1] and engageTarget > 0 and ent:GetHPPercent(engageTarget) > 5 then
             local q = get_debuff_queue(engageTarget, rdm)
@@ -1852,11 +2736,16 @@ ashita.events.register('d3d_present', 'logic_loop', function()
     end
 
     ------------------------------------------------------------
+    -- BRD SCHEDULER -- cycle-timer bard; songs/JAs fire on the bard box via /mst.
+    ------------------------------------------------------------
+    geo_mod.brd.tick(now)
+
+    ------------------------------------------------------------
     -- CHARACTER LOGIC
 ------------------------------------------------------------
     for _, c in ipairs(chars) do
         if not c.is_main then
-            local want_follow = c.f[1] and not c.debuff_pause
+            local want_follow = c.f[1] and not c.debuff_pause and not ((c.runto and c.runto[1]) or c.run_active)
             if want_follow and c.actual_follow ~= true then
                 qcmd(c.cmd_follow_on, true)
                 c.actual_follow = true
@@ -1876,11 +2765,11 @@ ashita.events.register('d3d_present', 'logic_loop', function()
                         do_action(c, '/ma "Absorb-TP" Aminon', 1.5, now)
                     end
 
-                    if c.e[1] then
+                    if c.e[1] and not c.brd_hold then
                         if main_is_attacking and engageTarget > 0 then
                             local time_since = now - (c.last_engage_time or 0)
                             if (c.last_engage_target ~= engageTarget or not is_attacking)
-                                and time_since >= ENGAGE_RETRY_GAP then
+                                and time_since >= TIMING.engage then
                                 local cmd = c.cmd_attack_on
                                 chat:QueueCommand(1, cmd)
                                 queue_retry(c, cmd, now)
@@ -1970,7 +2859,8 @@ ashita.events.register('d3d_present', 'render_ui', function()
             local mn = (config.healers[1] and config.healers[1].name or ''):lower()
             local bn = (config.healers[2] and config.healers[2].name or ''):lower()
             local gn = (config.geo and config.geo.character or ''):lower()
-            local mon, bon, gon = hstat(mn), hstat(bn), hstat(gn)
+            local dn = (config.brd and config.brd.character or ''):lower()
+            local mon, bon, gon, don = hstat(mn), hstat(bn), hstat(gn), hstat(dn)
             imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
             imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
             imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
@@ -2022,6 +2912,33 @@ ashita.events.register('d3d_present', 'render_ui', function()
                     gn:sub(1,3):upper() .. (gon and '' or '!'))
                 tip('Geomancer: ' .. gn .. (gon and '' or ' - offline'))
             end
+            -- BRD identifier: structurally mirrors `GEO: GOO`. The `BRD:` button
+            -- (purple text on transparent bg) toggles the integrated Bard window
+            -- (geo_mod.brd.show_window) -- the same window the /sync brd command and
+            -- the in-window controls drive. It never touches config.brd.sing (the
+            -- Sing checkbox / `/sync sing` that actually starts/stops the playlist).
+            igSameLine(0, 10)
+            imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+            imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+            imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+            imgui.PushStyleColor(ImGuiCol_Text, STYLE_BTN.brd)
+            if igSmallButton('BRD:##brdbtn') then
+                geo_mod.brd.show_window = not geo_mod.brd.show_window
+            end
+            imgui.PopStyleColor(4)
+            tip(dn == ''
+                and 'Bard song cycle - click to open the Bard window and assign a BRD box (/sync brd)'
+                or ('Bard: ' .. dn .. (don and '' or ' - offline')
+                    .. '  -  click to open the Bard window (/sync brd); /sync sing toggles casting'))
+            igSameLine(0, 4)
+            if dn == '' then
+                igTextDisabled('--')
+                tip('Bard: (unassigned)')
+            else
+                igTextColored(don and STYLE_BTN.brd or COLOR_OFFLINE,
+                    dn:sub(1,3):upper() .. (don and '' or '!'))
+                tip('Bard: ' .. dn .. (don and '' or ' - offline'))
+            end
             -- Close X: right-justified to the window's right edge so it sits
             -- in the top-right corner regardless of how wide the table grows
             -- below. geo_mod.right_align falls back gracefully if the binding
@@ -2059,6 +2976,16 @@ ashita.events.register('d3d_present', 'render_ui', function()
                     imgui.PushStyleColor(ImGuiCol_Text, COLOR_GUEST)
                     if igSmallButton(col.hdr .. '##debhdrbtn') then
                         show_debuffpanel = not show_debuffpanel
+                    end
+                    imgui.PopStyleColor(4)
+                    tip(col.tip)
+                elseif col.key == 'e' then
+                    imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+                    imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+                    imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+                    imgui.PushStyleColor(ImGuiCol_Text, COLOR_GUEST)
+                    if igSmallButton(col.hdr .. '##enghdrbtn') then
+                        hunt_mod.show_panel = not hunt_mod.show_panel
                     end
                     imgui.PopStyleColor(4)
                     tip(col.tip)
@@ -2290,10 +3217,16 @@ ashita.events.register('d3d_present', 'render_advanced', function()
 
     igSetNextWindowBgAlpha(0.65)
     if igBegin('Sync - Advanced', ADV_WINDOW_OPEN, ADV_WINDOW_FLAGS) then
-        if igSmallButton('x##advclose') then show_advanced = false; adv_seeded = false end
-        tip('Close (or click Heal: in the main HUD)')
-        igSameLine(0, 6); igTextColored(COLOR_GUEST, 'Crew / Healing')
+        igTextColored(COLOR_GUEST, 'Crew / Healing')
         tip('Crew roster + per-healer kit. Hover any field for details.')
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
+        if igSmallButton('x##advclose') then show_advanced = false; adv_seeded = false end
+        imgui.PopStyleColor(4)
+        tip('Close (or click Heal: in the main HUD)')
         igTextDisabled('Enter commits text fields; Save flushes all & writes settings.')
         imgui.Separator()
         igText('Crew')
@@ -2307,6 +3240,12 @@ ashita.events.register('d3d_present', 'render_advanced', function()
             end
             tip('Crew slot ' .. i .. role .. ' - character name (press Enter to commit)')
         end
+
+        imgui.Separator()
+        igTextDisabled('BRD box: configure in the Bard window (click "BRD:" in the main HUD, or /sync brd).')
+
+        if igSmallButton('Combat##opencombat') then hunt_mod.show_panel = not hunt_mod.show_panel end
+        tip('Open the Combat panel: per-box face-lock + radius pack-hunting (/sync combat)')
 
         for sN = 1, #config.healers do
             local h, b = config.healers[sN], adv_h[sN]
@@ -2647,15 +3586,203 @@ local function buff_row(t, col)
     end
 end
 
+------------------------------------------------------------
+-- COMBAT PANEL (face-lock + radius pack-hunting)
+------------------------------------------------------------
+-- Per-box Face / Hunt toggles plus a mob whitelist per box. Empty whitelist =>
+-- that box hunts ANY valid mob inside the radius; pack-hunting spreads the crew
+-- across distinct mobs and only doubles up (on the highest-HP mob) when there
+-- are fewer mobs than hunters. Radius + whitelists persist; Face/Hunt reset on
+-- zone with the other combat flags.
+local function combat_addbuf(nl)
+    local b = hunt_mod.addbuf[nl]
+    if not b then b = { '' }; hunt_mod.addbuf[nl] = b end
+    return b
+end
+
+ashita.events.register('d3d_present', 'render_combatpanel', function()
+    if not hunt_mod.show_panel then return end
+    igSetNextWindowBgAlpha(0.65)
+    hunt_mod.open[1] = true
+    if igBegin('Sync - Combat', hunt_mod.open, hunt_mod.flags) then
+        igTextColored(COLOR_GUEST, 'Combat / Hunt')
+        tip('Per-box face-lock + radius pack-hunting. Empty whitelist = any mob in radius.')
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
+        if igSmallButton('x##combatclose') then hunt_mod.show_panel = false end
+        imgui.PopStyleColor(4)
+        tip('Close (or /sync combat)')
+
+        imgui.SetNextItemWidth(140)
+        if imgui.SliderFloat('radius (yalms)##cradius', hunt_mod.radius_buf, 3.0, 30.0, '%.0f') then
+            config.combat.radius = hunt_mod.radius_buf[1]
+            settings.save()
+        end
+        tip('Acquisition radius (per box). Mobs beyond this are ignored.')
+        igTextDisabled('Pull distance and fight (leash) range are now PER-CHARACTER -- set below, per box.')
+
+        if not hunt_mod.rdiabuf then hunt_mod.rdiabuf = { config.combat.rdm_dia or '' } end
+        imgui.SetNextItemWidth(240)
+        local rdia_done = imgui.InputText('RDM hunt-debuff##rdmdia', hunt_mod.rdiabuf, 64, ImGuiInputTextFlags_EnterReturnsTrue)
+        if not rdia_done and imgui.IsItemDeactivatedAfterEdit then rdia_done = imgui.IsItemDeactivatedAfterEdit() end
+        if rdia_done then
+            config.combat.rdm_dia = hunt_mod.rdiabuf[1] or ''
+            settings.save()
+        end
+        tip('Command the RDM casts once on each newly-engaged mob. Use <t>, e.g. /ma \"Dia III\" <t> or an alias like //dia3 <t>. Empty = off.')
+        imgui.Separator()
+
+        if igSmallButton('Set Camp##campset') then hunt_mod.camp_set() end
+        tip('Save the main\'s current position as the campsite (/sync camp set).')
+        igSameLine(0, 6)
+        if igSmallButton('Return##campgo') then hunt_mod.camp_go() end
+        tip('Send the crew back to the saved campsite (/sync camp). Experimental movement.')
+        if config.combat.camp_set then
+            igSameLine(0, 8)
+            igTextDisabled(string.format('(%.0f, %.0f)', config.combat.camp_x or 0, config.combat.camp_y or 0))
+        end
+        if (hunt_mod.yaw_off or 0) ~= 0 then
+            igSameLine(0, 8)
+            igTextDisabled(string.format('face yaw: %.3f', hunt_mod.yaw_off))
+            tip('Saved face-calibration offset (persists across reloads). /sync faced reset to clear.')
+        end
+
+        igText('Blacklist (never hunt):')
+        tip('Mob names here are never hunted by any box.')
+        local BL = config.combat.blacklist
+        if #BL > 0 then
+            for i = #BL, 1, -1 do
+                if igSmallButton('x##bl' .. i) then
+                    t_remove(BL, i); settings.save()
+                else
+                    igSameLine(0, 4); igTextDisabled(BL[i]); igSameLine(0, 10)
+                end
+            end
+            igText('')
+        end
+        imgui.SetNextItemWidth(150)
+        if imgui.InputText('##bladd', hunt_mod.blbuf, 48, ImGuiInputTextFlags_EnterReturnsTrue) then
+            local nm = (hunt_mod.blbuf[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')
+            if nm ~= '' then t_insert(BL, nm); settings.save() end
+            hunt_mod.blbuf[1] = ''
+        end
+        tip('Add a mob name to the global blacklist (Enter).')
+        imgui.Separator()
+
+        for _, c in ipairs(chars) do
+            local role = c.is_main and ' (main)' or (c.is_rdm and ' (rdm)' or '')
+            igText(c.disp_name .. role)
+            tip('Box: ' .. c.name)
+            igSameLine(0, 10)
+            if igCheckbox('Face##face' .. c.name_lower, c.face) then c.face_sent = nil end
+            tip('Face-lock: turn this box to face its target while engaged (writes actor heading).')
+            igSameLine(0, 8)
+            local hm_cur = config.combat.huntmode[c.name_lower] or 0
+            local hm_lbl = (hm_cur == 2 and 'Converge') or (hm_cur == 1 and 'Hunt') or 'Hunt:Off'
+            if igSmallButton(hm_lbl .. '##hm' .. c.name_lower) then
+                local nxt = (hm_cur + 1) % 3
+                config.combat.huntmode[c.name_lower] = nxt
+                c.hunt[1] = (nxt > 0)
+                settings.save()
+            end
+            tip('Hunt mode -- click to cycle: Hunt:Off / Hunt (box picks its own distinct mob) / Converge (all Converge boxes share the same highest-HP mob in radius). Mix Hunt + Converge freely per box.')
+            if not c.is_main then
+                igSameLine(0, 8)
+                igCheckbox('Run##run' .. c.name_lower, c.runto)
+                tip('Run to mob: move this box to its assigned mob (suppresses follow). Experimental.')
+                local rm = config.combat.retmode[c.name_lower] or 0
+                local rlbl = (rm == 1 and 'Ret:Claim') or (rm == 2 and 'Ret:Death') or 'Ret:Off'
+                igSameLine(0, 8)
+                if igSmallButton(rlbl .. '##ret' .. c.name_lower) then
+                    config.combat.retmode[c.name_lower] = (rm + 1) % 3
+                    settings.save()
+                end
+                tip('Return to camp -- click to cycle: Off / Claim (drag each claimed mob back to camp) / Death (return to camp after the mob dies). Needs a campsite set.')
+            end
+
+            local pb = hunt_mod.pullbuf[c.name_lower]
+            if not pb then pb = { hunt_mod.pull_cmd(c) }; hunt_mod.pullbuf[c.name_lower] = pb end
+            imgui.SetNextItemWidth(220)
+            -- FIX: EnterReturnsTrue alone only commits if the user presses Enter
+            -- while the field is focused. Clicking away (e.g. straight to the Hunt
+            -- mode button) silently discarded whatever was typed -- pull_cmd kept
+            -- returning '' forever, so the pull condition (pc ~= '') never passed
+            -- and the configured pull command never fired. IsItemDeactivatedAfterEdit
+            -- also commits on focus-loss after an edit, closing that gap.
+            local pull_done = imgui.InputText('pull##pull' .. c.name_lower, pb, 64, ImGuiInputTextFlags_EnterReturnsTrue)
+            if not pull_done and imgui.IsItemDeactivatedAfterEdit then pull_done = imgui.IsItemDeactivatedAfterEdit() end
+            if pull_done then
+                config.combat.pull[c.name_lower] = pb[1] or ''
+                settings.save()
+            end
+            tip('Pull action fired once per newly-acquired mob to draw it into range. Use <t>, e.g. /ma \"Dia III\" <t>  |  /ra <t>  |  /ja \"Sic\" <t>. Empty = none.\nMust be a command this box\'s OWN client recognizes -- a personal alias (e.g. /dia2) only works if that alias is defined on this box\'s Ashita install.')
+
+            local pdb = hunt_mod.pulldistbuf[c.name_lower]
+            if not pdb then pdb = { config.combat.pull_dist[c.name_lower] or 20.0 }; hunt_mod.pulldistbuf[c.name_lower] = pdb end
+            imgui.SetNextItemWidth(150)
+            if imgui.SliderFloat('pull dist##pulldist' .. c.name_lower, pdb, 3.0, 30.0, '%.0f') then
+                config.combat.pull_dist[c.name_lower] = pdb[1]
+                settings.save()
+            end
+            tip('This box only fires its pull command when within this many yalms of the mob.')
+
+            if not c.is_main then
+                local frb = hunt_mod.frangbuf[c.name_lower]
+                if not frb then frb = { config.combat.fight_range[c.name_lower] or 3.5 }; hunt_mod.frangbuf[c.name_lower] = frb end
+                imgui.SameLine(0, 12)
+                imgui.SetNextItemWidth(150)
+                if imgui.SliderFloat('fight range##frange' .. c.name_lower, frb, 1.0, 25.0, '%.1f') then
+                    config.combat.fight_range[c.name_lower] = frb[1]
+                    settings.save()
+                end
+                tip('Max yalms this box will let the mob drift before walking back in. Set tight (~3.5-4.9y) for melee so it never falls out of WS/melee range. Set generously for ranged/mages so they hold position instead of closing in.')
+            end
+
+            local L = hunt_mod.list(c)
+            if #L > 0 then
+                for i = #L, 1, -1 do
+                    if igSmallButton('x##del' .. c.name_lower .. i) then
+                        t_remove(L, i); settings.save()
+                    else
+                        igSameLine(0, 4); igTextDisabled(L[i]); igSameLine(0, 10)
+                    end
+                end
+                igText('')
+            end
+
+            local b = combat_addbuf(c.name_lower)
+            imgui.SetNextItemWidth(150)
+            if imgui.InputText('##add' .. c.name_lower, b, 48, ImGuiInputTextFlags_EnterReturnsTrue) then
+                local nm = (b[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')
+                if nm ~= '' then t_insert(L, nm); settings.save() end
+                b[1] = ''
+            end
+            tip('Add a mob name to this box\'s whitelist (Enter). Leave the list empty to hunt anything.')
+            imgui.Separator()
+        end
+    end
+    igEnd()
+    if not hunt_mod.open[1] then hunt_mod.show_panel = false end
+end)
+
 ashita.events.register('d3d_present', 'render_buffpanel', function()
     if not show_buffpanel then return end
     igSetNextWindowBgAlpha(0.55)
     BUFF_PANEL_OPEN[1] = true
     if igBegin('RDM Buff Controls', BUFF_PANEL_OPEN, BUFF_PANEL_FLAGS) then
-        if igSmallButton('x##buffclose') then show_buffpanel = false end
-        tip('Close (or click "buf" in the main HUD, or /sync panel)')
-        igSameLine(0, 6); igTextColored(COLOR_GUEST, 'RDM Buff Controls')
+        igTextColored(COLOR_GUEST, 'RDM Buff Controls')
         tip('Per-member RDM buff toggles. Hover any cell for what it does.')
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
+        if igSmallButton('x##buffclose') then show_buffpanel = false end
+        imgui.PopStyleColor(4)
+        tip('Close (or click "buf" in the main HUD, or /sync panel)')
         if igBeginTable('RdmBuffTable', 8, BUFF_TBL_FLAGS) then
             igTableSetupColumn('Member',  0, 0)
             igTableSetupColumn('Buff',    0, 0)
@@ -2691,10 +3818,16 @@ ashita.events.register('d3d_present', 'render_debuffpanel', function()
     igSetNextWindowBgAlpha(0.55)
     DEBUFF_PANEL_OPEN[1] = true
     if igBegin('RDM Debuffs', DEBUFF_PANEL_OPEN, DEBUFF_PANEL_FLAGS) then
-        if igSmallButton('x##debclose') then show_debuffpanel = false end
-        tip('Close (or click "deb" in the main HUD, or /sync dpanel)')
-        igSameLine(0, 6); igTextColored(COLOR_GUEST, 'RDM Debuffs')
+        igTextColored(COLOR_GUEST, 'RDM Debuffs')
         tip("Cast on the main's engaged target. Order: Silence > Dia III > Frazzle III > Distract III.")
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
+        if igSmallButton('x##debclose') then show_debuffpanel = false end
+        imgui.PopStyleColor(4)
+        tip('Close (or click "deb" in the main HUD, or /sync dpanel)')
 
         local r = cached_rdm
         if not r then
@@ -2890,7 +4023,12 @@ end
 
 function geo_mod.text_cell(tag, buf, w, on_done)
     imgui.SetNextItemWidth(w or 110)
-    if imgui.InputText(tag, buf, 32, ImGuiInputTextFlags_EnterReturnsTrue) then
+    -- FIX: match num_cell's commit-on-focus-loss (was Enter-only -- clicking
+    -- away from the field silently discarded whatever was typed, same bug
+    -- class already fixed for the Combat panel's pull field).
+    local done = imgui.InputText(tag, buf, 32, ImGuiInputTextFlags_EnterReturnsTrue)
+    if not done and imgui.IsItemDeactivatedAfterEdit then done = imgui.IsItemDeactivatedAfterEdit() end
+    if done then
         on_done()
     end
 end
@@ -2953,6 +4091,266 @@ function geo_mod.fmt_mmss(n)
     if n < 0 then n = 0 end
     n = math.floor(n)
     return ('%d:%02d'):format(math.floor(n / 60), n % 60)
+end
+
+------------------------------------------------------------
+-- BRD methods (cycle / casting / playlists)
+------------------------------------------------------------
+function geo_mod.brd.reset_cycle()
+    local c = geo_mod.brd.cycle
+    c.idx = 1; c.phase = 'casting'; c.start = os.time(); c.ann60 = false; c.ann30 = false
+    c.ja_done = c.ja_done or {}
+    c.ja_done.soul_voice  = false
+    c.ja_done.nightingale = false
+    c.ja_done.troubadour  = false
+    c.ja_done.clarion     = false
+    c.row_idx = 0; c.row_marcato = false; c.row_pianissimo = false
+end
+
+function geo_mod.brd.song_from_command(str)
+    if not str or str == '' then return nil end
+    return geo_mod.brd.song_lookup[(str:gsub('[%s%p]', '')):lower()]
+end
+
+-- Returns the canonical cast name if `name` is a known song, else nil.
+function geo_mod.brd.song_valid(name)
+    if not name then return nil end
+    return geo_mod.brd.song_lookup[(name:gsub('[%s%p]', '')):lower()]
+end
+
+function geo_mod.brd.find_bard()
+    local nm = (config.brd and config.brd.character or ''):lower()
+    if nm == '' then return nil end
+    for _, c in ipairs(chars) do if c.name_lower == nm then return c end end
+    return nil
+end
+
+function geo_mod.brd.set_sing(on)
+    config.brd.sing = on and true or false
+    geo_mod.brd.reset_cycle()
+    settings.save()
+end
+
+-- Marcato is still a SINGLE across the whole playlist (long recast) -- turning it
+-- on for one row clears it off every OTHER row. Marcato and Pianissimo are NO
+-- LONGER mutually exclusive ON THE SAME ROW: both may be set together for the
+-- (rare) Marcato'd single-target song. check_song handles that fine -- it fires
+-- Marcato, then Pianissimo, then casts the song ST at the row target. Enabling
+-- one no longer clears the other.
+function geo_mod.brd.set_marcato(i, on)
+    local e = config.brd.songs[i]; if not e then return end
+    if on then
+        for j, other in ipairs(config.brd.songs) do if j ~= i then other.marcato = false end end
+        e.marcato = true   -- was also clearing e.pianissimo; no longer does
+    else
+        e.marcato = false
+    end
+    settings.save()
+end
+
+function geo_mod.brd.set_pianissimo(i, on)
+    local e = config.brd.songs[i]; if not e then return end
+    e.pianissimo = on and true or false   -- was also clearing e.marcato; no longer does
+    settings.save()
+end
+
+-- Per-row (enabled/marcato/pianissimo/target) checkbox + text buffers for one
+-- playlist entry, created once per distinct song name and reused every frame
+-- -- same idiom as the Combat panel's combat_addbuf/pullbuf lazy buffers.
+-- en/m/p are resynced from the entry every frame by the caller (cheap, and
+-- keeps external changes -- e.g. /sync brd marcato -- reflected live); the
+-- target text buffer is seeded ONCE from e.target here and only advances on
+-- commit, matching every other text field's Enter/focus-loss idiom in this
+-- file (continuously reseeding a text buffer would fight in-progress typing).
+function geo_mod.brd.row_buf(e)
+    local r = geo_mod.brd.buf.row[e.name]
+    if not r then
+        r = { en = {false}, m = {false}, p = {false}, t = { e.target or '' } }
+        geo_mod.brd.buf.row[e.name] = r
+    end
+    return r
+end
+
+function geo_mod.brd.clone_entries(src)
+    local out = T{}
+    for _, e in ipairs(src) do
+        out[#out + 1] = T{
+            name = e.name, enabled = e.enabled ~= false,
+            marcato = e.marcato or false, pianissimo = e.pianissimo or false,
+            target = e.target or '',
+        }
+    end
+    return out
+end
+
+function geo_mod.brd.save_playlist(name)
+    name = (name or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if name == '' then return end
+    config.brd.playlists[name] = T{
+        entries = geo_mod.brd.clone_entries(config.brd.songs),
+        ja = T{
+            nightingale = config.brd.nightingale == true,
+            troubadour  = config.brd.troubadour  == true,
+            soul_voice  = config.brd.soul_voice  == true,
+            clarion     = config.brd.clarion     == true,
+        },
+    }
+    config.brd.current_playlist = name
+    settings.save()
+    print(('[sync] BRD playlist saved: %s (%d songs)'):format(name, #config.brd.songs))
+end
+
+function geo_mod.brd.load_playlist(name)
+    local p = config.brd.playlists[name]
+    if not p then print('[sync] BRD: no playlist named "' .. tostring(name) .. '"'); return end
+    config.brd.songs = geo_mod.brd.clone_entries(p.entries or {})
+    if p.ja then
+        config.brd.nightingale = p.ja.nightingale == true
+        config.brd.troubadour  = p.ja.troubadour  == true
+        config.brd.soul_voice  = p.ja.soul_voice  == true
+        config.brd.clarion     = p.ja.clarion     == true
+    end
+    config.brd.current_playlist = name
+    settings.save()
+    -- NOTE: cycle intentionally NOT reset on load (mirrors Singer) so swapping a
+    -- playlist mid-cycle doesn't trigger an immediate re-sing.
+    print(('[sync] BRD playlist loaded: %s (%d songs)'):format(name, #config.brd.songs))
+end
+
+function geo_mod.brd.delete_playlist(name)
+    if not config.brd.playlists[name] then print('[sync] BRD: no playlist named "' .. tostring(name) .. '"'); return end
+    config.brd.playlists[name] = nil
+    if config.brd.current_playlist == name then config.brd.current_playlist = '' end
+    settings.save()
+    print('[sync] BRD playlist deleted: ' .. name)
+end
+
+function geo_mod.brd.playlist_names()
+    local out = {}
+    for n in pairs(config.brd.playlists) do out[#out + 1] = n end
+    table.sort(out)
+    return out
+end
+
+----------------------------------------------------------------------------------------------------
+-- check_song: one tick of the cycle, fired remotely on the bard box `c`. Walks
+-- from cycle.idx; skips disabled / unknown / Pianissimo-without-target. Each
+-- enabled JA is ATTEMPTED ONCE (global JAs once per cycle; Marcato/Pianissimo
+-- once per row) -- no recast/buff monitoring. If the JA is on cooldown the game
+-- ignores the command; we've flagged it attempted, so the cascade just proceeds
+-- to the next JA and then the song. Phase flips to 'waiting' at the playlist end.
+----------------------------------------------------------------------------------------------------
+function geo_mod.brd.check_song(c, now)
+    local b = config.brd
+    local entries = b.songs
+    if #entries == 0 then return end
+    local cyc = geo_mod.brd.cycle
+    local done = cyc.ja_done
+    local function fire(cmd) do_action(c, cmd, geo_mod.brd.ja_lock, now) end
+
+    while cyc.idx <= #entries do
+        -- New row? reset the per-row JA one-shots.
+        if cyc.row_idx ~= cyc.idx then
+            cyc.row_idx = cyc.idx; cyc.row_marcato = false; cyc.row_pianissimo = false
+        end
+        local e = entries[cyc.idx]
+        if not e.enabled then
+            cyc.idx = cyc.idx + 1
+        else
+            local enl = geo_mod.brd.song_valid(e.name)
+            if not enl then
+                cyc.idx = cyc.idx + 1
+            elseif e.pianissimo and (not e.target or e.target == '') then
+                cyc.idx = cyc.idx + 1   -- Pianissimo row with no target: skip
+            else
+                -- Global JAs -- one attempt per cycle, in cascade order.
+                if b.soul_voice and not done.soul_voice then
+                    done.soul_voice = true; fire('/ja "Soul Voice" <me>'); return
+                end
+                if b.nightingale and not done.nightingale then
+                    done.nightingale = true; fire('/ja "Nightingale" <me>'); return
+                end
+                if b.troubadour and not done.troubadour then
+                    done.troubadour = true; fire('/ja "Troubadour" <me>'); return
+                end
+                if b.clarion and not done.clarion then
+                    done.clarion = true; fire('/ja "Clarion Call" <me>'); return
+                end
+                -- Per-row JAs -- one attempt for THIS row.
+                if e.marcato and not cyc.row_marcato then
+                    cyc.row_marcato = true; fire('/ja "Marcato" <me>'); return
+                end
+                if e.pianissimo and not cyc.row_pianissimo then
+                    cyc.row_pianissimo = true; fire('/ja "Pianissimo" <me>'); return
+                end
+                -- Cast the song (Pianissimo'd -> ST at the row target, else <me>).
+                local tgt = (e.pianissimo and e.target ~= '') and e.target or '<me>'
+                do_action(c, ('/ma "%s" %s'):format(enl, tgt), (b.delay or 2.0) + geo_mod.brd.song_cast, now)
+                cyc.idx = cyc.idx + 1
+                return
+            end
+        end
+    end
+    cyc.phase = 'waiting'   -- walked off the end; restart on interval
+end
+
+----------------------------------------------------------------------------------------------------
+-- tick: scheduler entry, called once per logic_loop frame. Cycle restart,
+-- pre-restart announces, opt-in engage-lock, and action_lock-paced song casting.
+----------------------------------------------------------------------------------------------------
+function geo_mod.brd.tick(now)
+    local b = config.brd
+    if not b or not b.sing or not b.character or b.character == '' then
+        local hc = geo_mod.brd.find_bard()
+        if hc and hc.brd_hold then hc.brd_hold = false end
+        return
+    end
+    if now < geo_mod.brd.next_check then return end
+    geo_mod.brd.next_check = now + (geo_mod.brd.poll or 0.1)
+
+    local c = geo_mod.brd.find_bard()
+    if not c or not c.in_zone then return end
+    local cyc = geo_mod.brd.cycle
+    local iv  = b.interval or 240
+
+    if cyc.phase == 'waiting' then
+        local elapsed = os.time() - cyc.start
+        if elapsed >= iv then
+            geo_mod.brd.reset_cycle()
+        elseif b.announce then
+            local rem = iv - elapsed
+            if not cyc.ann60 and iv > 60 and rem <= 60 and rem > 0 then
+                cyc.ann60 = true
+                qcmd('/msp /echo ~~~*singing in 1min*~~~')
+            end
+            if not cyc.ann30 and iv > 30 and rem <= 30 and rem > 0 then
+                cyc.ann30 = true
+                qcmd('/msp /echo ~~~~~~~***singing in 30seconds***~~~~~~~')
+            end
+        end
+    end
+
+    -- Engage-lock (opt-in): disengaged while casting, released while waiting so
+    -- sync's normal engage tracking can re-engage. do_action bumps action_lock,
+    -- so we return and let the disengage settle before any song fires.
+    if b.engagelock then
+        local want_hold = (cyc.phase == 'casting')
+        if want_hold and not c.brd_hold then
+            do_action(c, '/attack off', 1.0, now)
+            c.brd_hold = true
+            return
+        elseif (not want_hold) and c.brd_hold then
+            c.brd_hold = false
+        end
+    end
+
+    if cyc.phase == 'waiting' then return end
+    if now <= c.action_lock then return end
+    geo_mod.brd.check_song(c, now)
+end
+
+function geo_mod.brd.reseed()
+    geo_mod.brd.buf.character[1] = (config.brd and config.brd.character) or ''
 end
 
 -- Cheap any-enabled gate: skip the entire extras evaluation when nothing in
@@ -3103,12 +4501,18 @@ ashita.events.register('d3d_present', 'render_geopanel', function()
     igSetNextWindowBgAlpha(0.65)
     geo_mod.open[1] = true
     if igBegin('Sync - Geomancer', geo_mod.open, geo_mod.flags) then
+        igTextColored(STYLE_BTN.geo, 'Geomancer')
+        tip('Indi / Geo bubble / Entrust scheduler. character = "" disables the whole block (no wasted ticks).')
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
         if igSmallButton('x##geoclose') then
             geo_mod.show_panel = false; geo_mod.seeded = false
         end
+        imgui.PopStyleColor(4)
         tip('Close (or click "GEO:" in the main HUD, or /sync geo)')
-        igSameLine(0, 6); igTextColored(STYLE_BTN.geo, 'Geomancer')
-        tip('Indi / Geo bubble / Entrust scheduler. character = "" disables the whole block (no wasted ticks).')
         igTextDisabled('Enter commits text fields; Save flushes all & writes settings.')
         imgui.Separator()
 
@@ -3415,6 +4819,252 @@ local function apply_command(cmd, tr, state)
     end
 end
 
+ashita.events.register('d3d_present', 'render_brdwindow', function()
+    if not geo_mod.brd.show_window then return end
+    if not geo_mod.brd.seeded then geo_mod.brd.reseed(); geo_mod.brd.seeded = true end
+    local b = config.brd
+
+    igSetNextWindowBgAlpha(0.65)
+    geo_mod.brd.open[1] = true
+    if igBegin('Sync - Bard', geo_mod.brd.open, geo_mod.brd.flags) then
+        igTextColored(STYLE_BTN.brd, 'Bard')
+        tip('Bard song cycle. Walks the playlist one cast per tick on the bard box (/mst <character>); restarts every Cycle interval. Songs/JAs fire remotely, paced by action-lock -- the main cannot read the bard recasts, so JA timing uses local estimates.')
+        do
+            local dn = (b.character or ''):lower()
+            local don = nil
+            if dn ~= '' then for _, c in ipairs(chars) do if c.name_lower == dn then don = c.in_zone; break end end end
+            igSameLine(0, 8)
+            if dn == '' then
+                igTextDisabled('(no box)')
+            else
+                igTextColored(don and STYLE_BTN.brd or COLOR_OFFLINE, dn:sub(1,3):upper() .. (don and '' or '!'))
+            end
+        end
+        geo_mod.right_align(18)
+        imgui.PushStyleColor(ImGuiCol_Button,        STYLE_BTN.bg)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, STYLE_BTN.hover)
+        imgui.PushStyleColor(ImGuiCol_ButtonActive,  STYLE_BTN.active)
+        imgui.PushStyleColor(ImGuiCol_Text, COLOR_OFFLINE)
+        if igSmallButton('x##brdclose') then geo_mod.brd.show_window = false; geo_mod.brd.seeded = false end
+        imgui.PopStyleColor(4)
+        tip('Close (or click "BRD:" in the main HUD, or /sync brd)')
+        imgui.Separator()
+
+        -- BRD box + master Sing toggle
+        igText('BRD box')
+        tip('Crew name of the bard. Empty disables the scheduler entirely.')
+        igSameLine(0, 8); imgui.SetNextItemWidth(110)
+        -- FIX: Enter-only commit silently discarded a typed name on click-away
+        -- (e.g. straight to the Sing checkbox) -- config.brd.character stayed
+        -- '', find_bard() never resolved, and singing just never started with
+        -- no error anywhere. Same bug class already fixed on the Combat panel's
+        -- pull field; add the IsItemDeactivatedAfterEdit fallback here too.
+        local brdchar_done = imgui.InputText('##brdchar', geo_mod.brd.buf.character, 32, ImGuiInputTextFlags_EnterReturnsTrue)
+        if not brdchar_done and imgui.IsItemDeactivatedAfterEdit then brdchar_done = imgui.IsItemDeactivatedAfterEdit() end
+        if brdchar_done then
+            b.character = (geo_mod.brd.buf.character[1] or ''):gsub('%s', ''):lower()
+            settings.save()
+            geo_mod.brd.buf.character[1] = b.character
+        end
+        tip('Character name of the bard box (must match a crew slot). Press Enter to commit.')
+        igSameLine(0, 12)
+        do
+            local ref = geo_mod.brd.buf.sing_ref; ref[1] = b.sing
+            if igCheckbox('Sing##brdsing', ref) then geo_mod.brd.set_sing(ref[1]) end
+            tip('Master on/off. Toggling EITHER direction resets the cycle timer.')
+        end
+
+        -- Status line
+        do
+            local n_songs = #b.songs
+            local lock_str = ''
+            local bc = geo_mod.brd.find_bard()
+            if bc and bc.brd_hold then lock_str = '  [atk off]' end
+            if not b.sing then
+                igText(('Status: 0:00 / %s  [idle]%s'):format(geo_mod.fmt_mmss(b.interval), lock_str))
+            else
+                local cyc = geo_mod.brd.cycle
+                local elapsed = math.min(os.time() - cyc.start, b.interval)
+                local phase_str
+                if cyc.phase == 'waiting' then
+                    local rem = math.max(0, b.interval - (os.time() - cyc.start))
+                    phase_str = ('waiting %s'):format(geo_mod.fmt_mmss(rem))
+                else
+                    local cur = cyc.idx; if cur > n_songs then cur = n_songs end; if cur < 1 then cur = 1 end
+                    phase_str = ('casting %d/%d'):format(cur, math.max(1, n_songs))
+                end
+                igText(('Status: %s / %s  [%s]%s'):format(geo_mod.fmt_mmss(elapsed), geo_mod.fmt_mmss(b.interval), phase_str, lock_str))
+            end
+            tip('Elapsed since the cycle began / cycle length, plus the current phase. [atk off] shows while the engage-lock holds the bard disengaged.')
+        end
+        imgui.Separator()
+
+        -- JA toggles
+        do local r = geo_mod.brd.buf.nightingale_ref; r[1] = b.nightingale
+           if igCheckbox('Nightingale##brd', r) then b.nightingale = r[1]; settings.save() end
+           tip('Nightingale -- bypasses song recast. Attempted once per cycle; if on cooldown the cycle just moves on.') end
+        igSameLine(0, 12)
+        do local r = geo_mod.brd.buf.troubadour_ref; r[1] = b.troubadour
+           if igCheckbox('Troubadour##brd', r) then b.troubadour = r[1]; settings.save() end
+           tip('Troubadour -- doubles song duration. Attempted once per cycle; if on cooldown the cycle just moves on.') end
+        do local r = geo_mod.brd.buf.soul_voice_ref; r[1] = b.soul_voice
+           if igCheckbox('Soul Voice##brd', r) then b.soul_voice = r[1]; settings.save() end
+           tip('Soul Voice (2hr). Attempted once per cycle while enabled; ignored by the game when on cooldown.') end
+        igSameLine(0, 12)
+        do local r = geo_mod.brd.buf.clarion_ref; r[1] = b.clarion
+           if igCheckbox('Clarion Call##brd', r) then b.clarion = r[1]; settings.save() end
+           tip('Clarion Call -- +1 song slot. Attempted once per cycle while enabled; ignored when on cooldown.') end
+        imgui.Separator()
+
+        -- Cycle interval + delay + announce + engagelock
+        igText(('Cycle: %s'):format(geo_mod.fmt_mmss(b.interval)))
+        tip('Playlist restart period. When this elapses since the cycle began, the playlist replays from song 1.')
+        igSameLine(0, 4)
+        if igSmallButton('-m##brdcyc') then b.interval = math.max(15, b.interval - 60); settings.save() end
+        tip('-1 minute')
+        igSameLine(0, 4)
+        if igSmallButton('+m##brdcyc') then b.interval = math.min(3600, b.interval + 60); settings.save() end
+        tip('+1 minute')
+        igSameLine(0, 4)
+        if igSmallButton('-s##brdcyc') then b.interval = math.max(15, b.interval - 5); settings.save() end
+        tip('-5 seconds')
+        igSameLine(0, 4)
+        if igSmallButton('+s##brdcyc') then b.interval = math.min(3600, b.interval + 5); settings.save() end
+        tip('+5 seconds')
+
+        igSameLine(0, 16)
+        igText(('Delay: %.1fs'):format(b.delay))
+        tip('Extra pause folded into each song action-lock. Raise if songs land before the previous cast resolves.')
+        igSameLine(0, 4)
+        if igSmallButton('-##brddelay') then b.delay = math.max(0, b.delay - 0.5); settings.save() end
+        igSameLine(0, 4)
+        if igSmallButton('+##brddelay') then b.delay = math.min(12, b.delay + 0.5); settings.save() end
+
+        do local r = geo_mod.brd.buf.announce_ref; r[1] = b.announce
+           if igCheckbox('Announce##brd', r) then b.announce = r[1]; settings.save() end
+           tip('/msp /echo party reminders 1 minute and 30 seconds before the playlist restarts.') end
+        igSameLine(0, 12)
+        do local r = geo_mod.brd.buf.engagelock_ref; r[1] = b.engagelock
+           if igCheckbox('Engage-lock##brd', r) then b.engagelock = r[1]; settings.save() end
+           tip('Opt-in: /attack off the bard while the playlist casts, releasing it to sync normal engage tracking once the cycle is waiting. Off by default so it never fights your combat flags.') end
+        imgui.Separator()
+
+        -- Playlists
+        local names = geo_mod.brd.playlist_names()
+        igText('Playlist:')
+        tip('Save / load named playlists. Each captures the song list (per-row M/P/target) AND the four JA toggles.')
+        igSameLine(0, 6)
+        if #names == 0 then
+            igTextDisabled('(none saved)')
+        else
+            if b.current_playlist ~= geo_mod.brd.buf.last_pl then
+                geo_mod.brd.buf.last_pl = b.current_playlist
+                local cur = b.current_playlist or ''
+                if cur ~= '' then for k, n in ipairs(names) do if n == cur then geo_mod.brd.buf.pl_idx[1] = k - 1; break end end end
+            end
+            if geo_mod.brd.buf.pl_idx[1] >= #names then geo_mod.brd.buf.pl_idx[1] = 0 end
+            geo_mod.spell_combo('##brdpl', names, geo_mod.brd.buf.pl_idx, function() end, 150)
+            igSameLine(0, 6)
+            if igSmallButton('Load##brdpl') then
+                local pn = names[geo_mod.brd.buf.pl_idx[1] + 1]; if pn then geo_mod.brd.load_playlist(pn) end
+            end
+            tip('Load the selected playlist -- REPLACES the current song list AND JA toggles.')
+            igSameLine(0, 4)
+            if igSmallButton('Del##brdpl') then
+                local pn = names[geo_mod.brd.buf.pl_idx[1] + 1]; if pn then geo_mod.brd.delete_playlist(pn) end
+            end
+            tip('Delete the selected playlist.')
+        end
+        igText('Save as:')
+        igSameLine(0, 6); imgui.SetNextItemWidth(150)
+        -- FIX: same click-away discard as the bard box field above. Lower risk
+        -- here since the 'Save' button next to it is an alternate commit path,
+        -- but fixing for consistency with num_cell/tier_cell/pull's idiom.
+        local brdpl_done = imgui.InputText('##brdplsave', geo_mod.brd.buf.pl_save, 64, ImGuiInputTextFlags_EnterReturnsTrue)
+        if not brdpl_done and imgui.IsItemDeactivatedAfterEdit then brdpl_done = imgui.IsItemDeactivatedAfterEdit() end
+        if brdpl_done then
+            local n = (geo_mod.brd.buf.pl_save[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')
+            if n ~= '' then geo_mod.brd.save_playlist(n); geo_mod.brd.buf.pl_save[1] = '' end
+        end
+        tip('Type a name + Enter (or Save) to snapshot the current playlist + JA toggles.')
+        igSameLine(0, 6)
+        if igSmallButton('Save##brdplsave') then
+            local n = (geo_mod.brd.buf.pl_save[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')
+            if n ~= '' then geo_mod.brd.save_playlist(n); geo_mod.brd.buf.pl_save[1] = '' end
+        end
+        imgui.Separator()
+
+        -- Songs (rows: en | name | M | P | target | ^ | v | x)
+        igText(('Songs (%d):'):format(#b.songs))
+        local remove_idx, swap_up_idx, swap_dn_idx
+        for i, e in ipairs(b.songs) do
+            local rb = geo_mod.brd.row_buf(e)
+            rb.en[1] = e.enabled ~= false
+            if igCheckbox(('##brden%d'):format(i), rb.en) then e.enabled = rb.en[1]; settings.save() end
+            tip('Skip this song in the playlist when unchecked.')
+            igSameLine(0, 6); igText(e.name)
+            igSameLine(0, 12)
+            rb.m[1] = e.marcato == true
+            if igCheckbox(('M##brdm%d'):format(i), rb.m) then geo_mod.brd.set_marcato(i, rb.m[1]) end
+            tip('Marcato (one song only across the playlist) -- fired before this song.')
+            igSameLine(0, 4)
+            rb.p[1] = e.pianissimo == true
+            if igCheckbox(('P##brdp%d'):format(i), rb.p) then geo_mod.brd.set_pianissimo(i, rb.p[1]) end
+            tip('Pianissimo -- fired before this song so it single-targets the name in the box to the right.')
+            igSameLine(0, 4)
+            imgui.SetNextItemWidth(90)
+            -- FIX: was flags=0, committing (and settings.save()-ing) on every
+            -- keystroke -- the only field in the file that didn't wait for
+            -- Enter/focus-loss. Matches num_cell/text_cell/pull's idiom now.
+            local tgt_done = imgui.InputText(('##brdt%d'):format(i), rb.t, 16, ImGuiInputTextFlags_EnterReturnsTrue)
+            if not tgt_done and imgui.IsItemDeactivatedAfterEdit then tgt_done = imgui.IsItemDeactivatedAfterEdit() end
+            if tgt_done then e.target = rb.t[1] or ''; settings.save() end
+            tip('Pianissimo single-target name (used only when P is checked).')
+            igSameLine(0, 4)
+            if igSmallButton(('^##brdup%d'):format(i)) then swap_up_idx = i end
+            tip('Move up.')
+            igSameLine(0, 2)
+            if igSmallButton(('v##brddn%d'):format(i)) then swap_dn_idx = i end
+            tip('Move down.')
+            igSameLine(0, 4)
+            if igSmallButton(('x##brdrm%d'):format(i)) then remove_idx = i end
+            tip('Remove from playlist.')
+        end
+        if swap_up_idx and swap_up_idx > 1 then
+            local a, c2 = b.songs[swap_up_idx - 1], b.songs[swap_up_idx]
+            b.songs[swap_up_idx - 1], b.songs[swap_up_idx] = c2, a; settings.save()
+        end
+        if swap_dn_idx and swap_dn_idx < #b.songs then
+            local a, c2 = b.songs[swap_dn_idx], b.songs[swap_dn_idx + 1]
+            b.songs[swap_dn_idx], b.songs[swap_dn_idx + 1] = c2, a; settings.save()
+        end
+        if remove_idx then table.remove(b.songs, remove_idx); settings.save() end
+
+        imgui.SetNextItemWidth(160)
+        -- FIX: same click-away discard as the bard box field. No alternate
+        -- 'Add' button exists for this one, so this was a fully silent failure
+        -- mode -- type a song, click the JA row right below it, song never added.
+        local brdadd_done = imgui.InputText('##brdaddsong', geo_mod.brd.buf.song_input, 64, ImGuiInputTextFlags_EnterReturnsTrue)
+        if not brdadd_done and imgui.IsItemDeactivatedAfterEdit then brdadd_done = imgui.IsItemDeactivatedAfterEdit() end
+        if brdadd_done then
+            local s = geo_mod.brd.song_from_command((geo_mod.brd.buf.song_input[1] or ''):gsub('%s+$', ''))
+            if s then
+                local dup = false
+                for _, ex in ipairs(b.songs) do if ex.name == s then dup = true; break end end
+                if not dup then
+                    b.songs[#b.songs + 1] = T{ name = s, enabled = true, marcato = false, pianissimo = false, target = '' }
+                    settings.save()
+                end
+            end
+            geo_mod.brd.buf.song_input[1] = ''
+        end
+        tip('Type a song name and press Enter to add (fuzzy: case/punctuation insensitive).')
+        igSameLine(0, 6); igText('(type a song, Enter to add)')
+    end
+    igEnd()
+    if not geo_mod.brd.open[1] then geo_mod.brd.show_window = false; geo_mod.brd.seeded = false end
+end)
+
 ashita.events.register('command', 'sync_rdmhelper_listener', function(e)
     local cmd = e.command:lower()
     
@@ -3472,7 +5122,8 @@ local COMMAND_LABELS = {
     sil  = 'Silence',
     dist = 'Distract III',
     fraz = 'Frazzle III',
-    dia  = 'Dia III'
+    dia  = 'Dia III',
+    face = 'Face-lock'
 }
 
 local function log_command_state(cmd, tr)
@@ -3595,6 +5246,300 @@ ashita.events.register('command', 'cmd_logic', function(e)
         show_debuffpanel = (a3 == 'on') or (a3 ~= 'off' and not show_debuffpanel)
         return
     end
+
+    -- /sync combat [on|off]   open/close the Combat panel
+    if a2 == 'combat' then
+        hunt_mod.show_panel = (a3 == 'on') or (a3 ~= 'off' and not hunt_mod.show_panel)
+        return
+    end
+
+    -- /sync radius <yalms>    set the hunt acquisition radius
+    if a2 == 'radius' then
+        local r = tonumber(a3)
+        if r and r > 0 then
+            config.combat.radius = r
+            hunt_mod.radius_buf[1] = r
+            settings.save()
+            print('[sync] hunt radius = ' .. r .. ' yalms')
+        else
+            print('[sync] hunt radius = ' .. (config.combat.radius or 12.0) .. ' yalms (usage: /sync radius <n>)')
+        end
+        return
+    end
+
+    -- /sync hunt <name|all> [on|off]   set Hunt mode (distinct-mob pack hunting)
+    -- for one or every in-zone box. Converge is panel-only (3-state cycle button
+    -- on /sync combat) since this command is a binary on/off.
+    -- FIX: this command used to fall through to the generic apply_command path,
+    -- which writes c.hunt[1] directly. hunt_mod.run() unconditionally rederives
+    -- c.hunt[1] FROM config.combat.huntmode every tick (the real, panel-driven
+    -- source of truth), so that write was silently overwritten within one tick
+    -- and the command had no lasting effect -- compounded by COMMAND_LABELS
+    -- having no 'hunt' entry, so log_command_state printed nothing either.
+    -- This now writes config.combat.huntmode directly, same as the panel button.
+    if a2 == 'hunt' then
+        local tr = a3 or 'all'
+        local want
+        if a4 == 'on' then want = 1 elseif a4 == 'off' then want = 0 end
+        if tr == 'all' then
+            if want == nil then
+                -- Mirror apply_command's bare-toggle convention: peek at the
+                -- first in-zone box's current mode and apply that flipped state
+                -- to everyone, rather than each box toggling off its own state.
+                for _, c in ipairs(chars) do
+                    if c.in_zone then
+                        want = ((config.combat.huntmode[c.name_lower] or 0) > 0) and 0 or 1
+                        break
+                    end
+                end
+                want = want or 1
+            end
+            for _, c in ipairs(chars) do
+                if c.in_zone then
+                    config.combat.huntmode[c.name_lower] = want
+                    c.hunt[1] = (want > 0)
+                end
+            end
+            settings.save()
+            print('[sync] hunt mode (all) -> ' .. (want > 0 and 'Hunt' or 'Off') .. '  (Converge: cycle via the Combat panel button)')
+        else
+            local t = find_target(tr)
+            if not t then print('[sync] hunt: no target matching "' .. tr .. '"'); return end
+            if want == nil then want = ((config.combat.huntmode[t.name_lower] or 0) > 0) and 0 or 1 end
+            config.combat.huntmode[t.name_lower] = want
+            t.hunt[1] = (want > 0)
+            settings.save()
+            print('[sync] hunt mode [' .. t.disp_name .. '] -> ' .. (want > 0 and 'Hunt' or 'Off'))
+        end
+        return
+    end
+
+    -- /sync faced [reset]   calibrate facing to this build's heading convention
+    if a2 == 'faced' then
+        hunt_mod.calibrate(mm:GetParty(), mm:GetEntity(), mm:GetTarget(), a3)
+        return
+    end
+
+    -- /sync sing [on|off]   master bard toggle (resets the cycle on either edge)
+    if a2 == 'sing' then
+        local target
+        if a3 == 'on' then target = true
+        elseif a3 == 'off' then target = false
+        else target = not config.brd.sing end
+        geo_mod.brd.set_sing(target)
+        print('[sync] BRD singing ' .. (config.brd.sing and 'on' or 'off'))
+        return
+    end
+
+    -- /sync brd ...   bard window + playlist + config (Singer folded into sync).
+    --   bare              toggle the Bard window
+    --   box <name>        set the bard box (also bare /sync brd <name>)
+    --   add <song> | remove <n|song> | clear | move <n|song> up|down
+    --   marcato <n|song> [on|off] | pianissimo <n|song> [target|off] | target <n|song> <name>
+    --   nightingale|troubadour|soul_voice|clarion|announce|engagelock [on|off]
+    --   delay <s> | interval <MM:SS|s> | playlist save|load|delete|list [name]
+    --   reset | save
+    if a2 == 'brd' then
+        if not a3 then geo_mod.brd.show_window = not geo_mod.brd.show_window; return end
+        local function joinfrom(i)
+            local t = {} for k = i, #args do t[#t+1] = args[k] end return table.concat(t, ' ')
+        end
+        local function resolve_idx(arg)
+            local n = tonumber(arg)
+            if n and config.brd.songs[n] then return n end
+            local s = geo_mod.brd.song_from_command(arg)
+            if s then for i, e in ipairs(config.brd.songs) do if e.name == s then return i end end end
+        end
+        -- FIX: move/marcato/pianissimo/target used to resolve_idx(args[4]) alone,
+        -- i.e. only the FIRST WORD of the song reference -- but almost every BRD
+        -- song name contains a space or apostrophe ("Mage's Ballad", "Hunter's
+        -- Prelude", "Valor Minuet"...), so by-name lookups on these four
+        -- subcommands silently failed for virtually any real song (the numeric
+        -- index was the only thing that actually worked). This tries the longest
+        -- possible join first (args[from..#args]) and peels one trailing token
+        -- (direction / on-off / target name) off the end until a song matches.
+        -- Returns idx, trailing (trailing is nil if nothing was left over).
+        local function resolve_idx_trailing(from)
+            for cut = #args, from, -1 do
+                local idx = resolve_idx(table.concat(args, ' ', from, cut))
+                if idx then
+                    local trailing = (cut < #args) and table.concat(args, ' ', cut + 1, #args) or nil
+                    return idx, trailing
+                end
+            end
+            return nil, nil
+        end
+        local jatoggles = { nightingale = true, troubadour = true, soul_voice = true,
+                            clarion = true, announce = true, engagelock = true, debug = true }
+
+        if a3 == 'box' then
+            config.brd.character = (args[4] or ''):gsub('%s', ''):lower()
+            if config.brd.character == 'off' or config.brd.character == 'none' then config.brd.character = '' end
+            geo_mod.brd.buf.character[1] = config.brd.character
+            settings.save()
+            print('[sync] BRD box = ' .. (config.brd.character == '' and '(disabled)' or config.brd.character))
+
+        elseif a3 == 'reset' then
+            geo_mod.brd.reset_cycle(); print('[sync] BRD cycle reset')
+
+        elseif a3 == 'save' then
+            settings.save(); print('[sync] BRD saved')
+
+        elseif jatoggles[a3] then
+            if a4 == 'on' then config.brd[a3] = true
+            elseif a4 == 'off' then config.brd[a3] = false
+            else config.brd[a3] = not config.brd[a3] end
+            settings.save()
+            print(('[sync] BRD %s %s'):format(a3, config.brd[a3] and 'on' or 'off'))
+
+        elseif a3 == 'delay' and args[4] then
+            local n = tonumber(args[4])
+            if n then config.brd.delay = n; settings.save(); print(('[sync] BRD delay %.1f'):format(n)) end
+
+        elseif (a3 == 'interval' or a3 == 'cycle') and args[4] then
+            local n = geo_mod.parse_mmss(args[4])
+            if n and n >= 15 and n <= 3600 then
+                config.brd.interval = n; settings.save()
+                print('[sync] BRD cycle interval ' .. geo_mod.fmt_mmss(n))
+            else
+                print('[sync] BRD interval: <MM:SS> or seconds (15..3600)')
+            end
+
+        elseif a3 == 'add' and args[4] then
+            local s = geo_mod.brd.song_from_command(joinfrom(4))
+            if not s then print('[sync] BRD: invalid song "' .. joinfrom(4) .. '"'); return end
+            for _, ex in ipairs(config.brd.songs) do
+                if ex.name == s then print('[sync] BRD: already in playlist: ' .. s); return end
+            end
+            config.brd.songs[#config.brd.songs + 1] = T{ name = s, enabled = true, marcato = false, pianissimo = false, target = '' }
+            settings.save(); print('[sync] BRD added ' .. s)
+
+        elseif a3 == 'remove' and args[4] then
+            local idx = resolve_idx(joinfrom(4))
+            if idx then
+                local nm = config.brd.songs[idx].name
+                table.remove(config.brd.songs, idx); settings.save(); print('[sync] BRD removed ' .. nm)
+            else
+                print('[sync] BRD: not in playlist: ' .. joinfrom(4))
+            end
+
+        elseif a3 == 'clear' then
+            for i = #config.brd.songs, 1, -1 do config.brd.songs[i] = nil end
+            settings.save(); print('[sync] BRD playlist cleared')
+
+        elseif a3 == 'move' and args[4] then
+            local idx, trailing = resolve_idx_trailing(4)
+            if not idx then print('[sync] BRD: not in playlist: ' .. joinfrom(4)); return end
+            local dir = trailing and trailing:lower() or ''
+            local songs = config.brd.songs
+            if dir == 'up' and idx > 1 then
+                songs[idx - 1], songs[idx] = songs[idx], songs[idx - 1]; settings.save(); print('[sync] BRD moved up')
+            elseif dir == 'down' and idx < #songs then
+                songs[idx], songs[idx + 1] = songs[idx + 1], songs[idx]; settings.save(); print('[sync] BRD moved down')
+            else
+                print('[sync] BRD move: <n|song> up|down (already at edge?)')
+            end
+
+        elseif a3 == 'marcato' and args[4] then
+            local idx, trailing = resolve_idx_trailing(4)
+            if not idx then print('[sync] BRD: not in playlist: ' .. joinfrom(4)); return end
+            local on
+            if trailing then on = (trailing:lower() == 'on') else on = not config.brd.songs[idx].marcato end
+            geo_mod.brd.set_marcato(idx, on)
+            print(('[sync] BRD Marcato %s on %s'):format(on and 'on' or 'off', config.brd.songs[idx].name))
+
+        elseif a3 == 'pianissimo' and args[4] then
+            local idx, trailing = resolve_idx_trailing(4)
+            if not idx then print('[sync] BRD: not in playlist: ' .. joinfrom(4)); return end
+            if trailing and trailing:lower() == 'off' then
+                geo_mod.brd.set_pianissimo(idx, false)
+                print('[sync] BRD Pianissimo off on ' .. config.brd.songs[idx].name)
+            else
+                local tgt = trailing or config.brd.songs[idx].target or ''
+                geo_mod.brd.set_pianissimo(idx, true)
+                config.brd.songs[idx].target = tgt; settings.save()
+                print(('[sync] BRD Pianissimo on %s -> %s'):format(config.brd.songs[idx].name, tgt))
+            end
+
+        elseif a3 == 'target' and args[4] then
+            local idx, trailing = resolve_idx_trailing(4)
+            if not idx or not trailing then
+                print('[sync] BRD: not in playlist (or missing target name): ' .. joinfrom(4))
+            else
+                config.brd.songs[idx].target = trailing; settings.save()
+                print(('[sync] BRD target on %s -> %s'):format(config.brd.songs[idx].name, trailing))
+            end
+
+        elseif a3 == 'playlist' then
+            local sub = a4
+            if sub == 'save' and args[5] then geo_mod.brd.save_playlist(joinfrom(5))
+            elseif sub == 'load' and args[5] then geo_mod.brd.load_playlist(joinfrom(5))
+            elseif sub == 'delete' and args[5] then geo_mod.brd.delete_playlist(joinfrom(5))
+            else
+                local n = geo_mod.brd.playlist_names()
+                if #n == 0 then print('[sync] BRD: no saved playlists')
+                else print('[sync] BRD playlists: ' .. table.concat(n, ', ')) end
+            end
+
+        else
+            -- bare /sync brd <name>: treat an unrecognised first token as a box name.
+            config.brd.character = a3:gsub('%s', ''):lower()
+            if config.brd.character == 'off' or config.brd.character == 'none' then config.brd.character = '' end
+            geo_mod.brd.buf.character[1] = config.brd.character
+            settings.save()
+            print('[sync] BRD box = ' .. (config.brd.character == '' and '(disabled)' or config.brd.character))
+        end
+        return
+    end
+
+    -- /sync camp [set|clear]   campsite return
+    --   /sync camp set    save the main's current position as the campsite
+    --   /sync camp        send the crew back to the saved campsite
+    --   /sync camp clear  forget the saved campsite
+    if a2 == 'camp' then
+        if a3 == 'set' then
+            hunt_mod.camp_set()
+        elseif a3 == 'clear' then
+            config.combat.camp_set = false; settings.save(); print('[sync] campsite cleared')
+        else
+            hunt_mod.camp_go()
+        end
+        return
+    end
+
+    -- /sync tname   print the current target's EXACT name + index (copy into the
+    -- whitelist/blacklist verbatim -- in-game display can differ on apostrophes).
+    if a2 == 'tname' then
+        local ti = get_target_index(mm:GetTarget())
+        if ti == 0 then print('[sync] no target'); return end
+        local em = mm:GetEntity()
+        print(string.format('[sync] target: "%s"  (idx %d)', em:GetName(ti) or '?', ti))
+        return
+    end
+
+    -- /sync bl [add <name> | rm <n> | clear]   manage the global blacklist.
+    -- Bare /sync bl lists what is stored so you can verify exact spelling.
+    if a2 == 'bl' then
+        local B = config.combat.blacklist
+        if a3 == 'add' then
+            local nm = e.command:match('^/sync%s+bl%s+add%s+(.+)$')
+            nm = nm and nm:gsub('%s+$', '') or ''
+            if nm ~= '' then table.insert(B, nm); settings.save(); print('[sync] blacklisted: ' .. nm) end
+        elseif a3 == 'rm' then
+            local n = tonumber(a4)
+            if n and B[n] then local g = B[n]; table.remove(B, n); settings.save(); print('[sync] removed: ' .. g) end
+        elseif a3 == 'clear' then
+            for i = #B, 1, -1 do B[i] = nil end; settings.save(); print('[sync] blacklist cleared')
+        else
+            if #B == 0 then print('[sync] blacklist empty')
+            else
+                print('[sync] blacklist (' .. #B .. '):')
+                for i = 1, #B do print(string.format('  %d. %s', i, B[i])) end
+            end
+        end
+        return
+    end
+
 
     -- /sync geo ...   GEO scheduler controls (mirror of the panel).
     --   /sync geo                  toggle the Geomancer panel
@@ -3766,13 +5711,17 @@ ashita.events.register('command', 'cmd_logic', function(e)
                     c.last_engage_target = 0
                     c.last_engage_time   = 0
                     c.retry              = nil
-                    
-                    -- Triple command burst to fight past animation lock states
+
+                    -- Triple command burst to fight past animation lock states.
+                    -- FIX: was coroutine.sleep(0.15) between each QueueCommand --
+                    -- the only coroutine.sleep in the whole file, and a blocking
+                    -- call here would stall the event thread for up to ~1.2s
+                    -- across a full crew (4 alts x 0.3s). Queued through the
+                    -- existing pending_casts pipeline (drained every logic tick)
+                    -- instead, matching every other timed sequence in this file.
                     chat:QueueCommand(1, c.cmd_attack_off)
-                    coroutine.sleep(0.15)
-                    chat:QueueCommand(1, c.cmd_attack_off)
-                    coroutine.sleep(0.15)
-                    chat:QueueCommand(1, c.cmd_attack_off)
+                    queue_cast(c, '/attack off', os_clock() + 0.15)
+                    queue_cast(c, '/attack off', os_clock() + 0.30)
                 end
             end
             print('[sync] Action Verified: Disengage signals issued; internal auto-engage flags wiped clean.')
@@ -3785,13 +5734,11 @@ ashita.events.register('command', 'cmd_logic', function(e)
                 t.last_engage_target = 0
                 t.last_engage_time   = 0
                 t.retry              = nil
-                
+
                 chat:QueueCommand(1, t.cmd_attack_off)
-                coroutine.sleep(0.15)
-                chat:QueueCommand(1, t.cmd_attack_off)
-                coroutine.sleep(0.15)
-                chat:QueueCommand(1, t.cmd_attack_off)
-                print(string.format('[sync] Action Verified: [%s] disengage burst complete; tracking reset.', t.disp_name))
+                queue_cast(t, '/attack off', os_clock() + 0.15)
+                queue_cast(t, '/attack off', os_clock() + 0.30)
+                print(string.format('[sync] Action Verified: [%s] disengage burst queued; tracking reset.', t.disp_name))
             else
                 print('[sync] Warning: Specified character target to disengage was missing or invalid.')
             end
@@ -3814,7 +5761,8 @@ ashita.events.register('command', 'cmd_logic', function(e)
     end
 
     local cmds = { f='f', e='e', d='deb', buf='buf', b='buf', qs='qs', bs='bs',
-                   abs='abs', hs='hs', fl='fl', ref='ref', heal='heal', c='heal' }
+                   abs='abs', hs='hs', fl='fl', ref='ref', heal='heal', c='heal',
+                   face='face' }
     local cmd, tr, st
     if cmds[a2] then cmd, tr, st = cmds[a2], a3 or 'all', a4 else cmd, tr, st = a3 and cmds[a3], a2, a4 end
 
