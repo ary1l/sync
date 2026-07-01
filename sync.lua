@@ -1738,7 +1738,7 @@ end
 function hunt_mod.do_pull(c, idx, cmd)
     if c.is_main then
         local tm = mm:GetTarget()
-        if tm then pcall(function() tm:SetTarget(idx, false) end) end
+        if tm then pcall(hunt_mod.set_target_safe, tm, idx) end
         chat:QueueCommand(1, cmd)
     else
         qcmd(c.mst_prefix .. '/rdmhelper exec ' .. idx .. ' ' .. cmd)
@@ -1897,7 +1897,7 @@ end
 function hunt_mod.attack(c, idx)
     if c.is_main then
         local tm = mm:GetTarget()
-        if tm then pcall(function() tm:SetTarget(idx, false) end) end
+        if tm then pcall(hunt_mod.set_target_safe, tm, idx) end
         chat:QueueCommand(1, '/attack on')
     else
         qcmd(c.mst_prefix .. '/rdmhelper hunt ' .. idx)
@@ -2316,6 +2316,25 @@ function hunt_mod.rdm_dia(rdm, ent, now)
 end
 
 ------------------------------------------------------------
+-- HOISTED PER-TICK HELPERS
+------------------------------------------------------------
+-- OPT: these two used to be closures created *inside* logic_loop, so a fresh
+-- function object was allocated on every 10Hz tick they were reached (steady GC
+-- churn + a logic_loop-scope local each). Parked on existing module tables so
+-- they're built once at load: zero per-tick allocation, zero new main-chunk
+-- locals (the 200-ceiling is at ~195), and two locals freed back to logic_loop.
+
+-- Blacklist redirect: pcall'd because SetTarget can throw on a stale entity.
+function hunt_mod.set_target_safe(tg, idx) tg:SetTarget(idx, false) end
+
+-- RDM charm watch: crew member is charmed (attacking us) and not yet asleep.
+function geo_mod.charmed_awake(t)
+    if not (t.heal and t.heal[1] and t.in_zone and t.pt_data) then return false end
+    local st = t.status or 0
+    return bit_band(st, CHARM_BIT) ~= 0 and bit_band(st, SLEEP_BIT) == 0
+end
+
+------------------------------------------------------------
 -- MAIN LOGIC LOOP
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'logic_loop', function()
@@ -2386,7 +2405,7 @@ ashita.events.register('d3d_present', 'logic_loop', function()
             if bl_nm and hunt_mod.blacklisted(bl_nm) then
                 local next_idx = (main_char._assign and main_char._assign > 0)
                                   and main_char._assign or 0
-                pcall(function() bl_tg:SetTarget(next_idx, false) end)
+                pcall(hunt_mod.set_target_safe, bl_tg, next_idx)
             end
         end
     end
@@ -2496,14 +2515,10 @@ ashita.events.register('d3d_present', 'logic_loop', function()
         -- them asleep with Sleep II (re-cast when the sleep wears, while charm
         -- persists). We never cure/wake a charmed member (see heal_pass).
         if rdmMP >= 30 then
-            local function charmed_awake(t)
-                if not (t.heal and t.heal[1] and t.in_zone and t.pt_data) then return false end
-                local st = t.status or 0
-                return bit_band(st, CHARM_BIT) ~= 0 and bit_band(st, SLEEP_BIT) == 0
-            end
+            local ca = geo_mod.charmed_awake
             local victim = nil
-            for _, c in ipairs(chars)  do if not c.is_rdm and charmed_awake(c) then victim = c; break end end
-            if not victim then for _, g in ipairs(guests) do if charmed_awake(g) then victim = g; break end end end
+            for _, c in ipairs(chars)  do if not c.is_rdm and ca(c) then victim = c; break end end
+            if not victim then for _, g in ipairs(guests) do if ca(g) then victim = g; break end end end
             if victim then
                 local locks = rdm.buff_locks[victim.name]
                 if not locks then locks = {}; rdm.buff_locks[victim.name] = locks end
@@ -2874,8 +2889,10 @@ ashita.events.register('d3d_present', 'render_ui', function()
             igSameLine(0, 4)
             igTextColored(mon and COLOR_GUEST or COLOR_OFFLINE,
                 (mn == '' and '--' or mn:sub(1,3):upper()) .. (mon and '' or '!'))
-            tip(mn == '' and 'Primary healer: (unassigned)'
-                or ('Primary healer: ' .. mn .. (mon and '' or ' - offline')))
+            if igIsItemHovered() then
+                igSetTooltip(mn == '' and 'Primary healer: (unassigned)'
+                    or ('Primary healer: ' .. mn .. (mon and '' or ' - offline')))
+            end
             igSameLine(0, 6)
             if bn == '' then
                 igTextDisabled('+--')
@@ -2883,7 +2900,7 @@ ashita.events.register('d3d_present', 'render_ui', function()
             else
                 igTextColored(bon and COLOR_RECOVERING or COLOR_OFFLINE,
                     '+' .. bn:sub(1,3):upper() .. (bon and '' or '!'))
-                tip('Backup healer: ' .. bn .. (bon and '' or ' - offline'))
+                if igIsItemHovered() then igSetTooltip('Backup healer: ' .. bn .. (bon and '' or ' - offline')) end
             end
             -- GEO identifier: structurally mirrors `Heal: SLO +GOO`. The
             -- `GEO:` button (green text on transparent bg) opens the
@@ -2899,10 +2916,12 @@ ashita.events.register('d3d_present', 'render_ui', function()
                 geo_mod.show_panel = not geo_mod.show_panel
             end
             imgui.PopStyleColor(4)
-            tip(gn == ''
-                and 'Geomancer scheduler - click to assign a GEO box and configure spells (/sync geo)'
-                or ('Geomancer: ' .. gn .. (gon and '' or ' - offline')
-                    .. '  -  click to open panel (/sync geo)'))
+            if igIsItemHovered() then
+                igSetTooltip(gn == ''
+                    and 'Geomancer scheduler - click to assign a GEO box and configure spells (/sync geo)'
+                    or ('Geomancer: ' .. gn .. (gon and '' or ' - offline')
+                        .. '  -  click to open panel (/sync geo)'))
+            end
             igSameLine(0, 4)
             if gn == '' then
                 igTextDisabled('--')
@@ -2910,7 +2929,7 @@ ashita.events.register('d3d_present', 'render_ui', function()
             else
                 igTextColored(gon and STYLE_BTN.geo or COLOR_OFFLINE,
                     gn:sub(1,3):upper() .. (gon and '' or '!'))
-                tip('Geomancer: ' .. gn .. (gon and '' or ' - offline'))
+                if igIsItemHovered() then igSetTooltip('Geomancer: ' .. gn .. (gon and '' or ' - offline')) end
             end
             -- BRD identifier: structurally mirrors `GEO: GOO`. The `BRD:` button
             -- (purple text on transparent bg) toggles the integrated Bard window
@@ -2926,10 +2945,12 @@ ashita.events.register('d3d_present', 'render_ui', function()
                 geo_mod.brd.show_window = not geo_mod.brd.show_window
             end
             imgui.PopStyleColor(4)
-            tip(dn == ''
-                and 'Bard song cycle - click to open the Bard window and assign a BRD box (/sync brd)'
-                or ('Bard: ' .. dn .. (don and '' or ' - offline')
-                    .. '  -  click to open the Bard window (/sync brd); /sync sing toggles casting'))
+            if igIsItemHovered() then
+                igSetTooltip(dn == ''
+                    and 'Bard song cycle - click to open the Bard window and assign a BRD box (/sync brd)'
+                    or ('Bard: ' .. dn .. (don and '' or ' - offline')
+                        .. '  -  click to open the Bard window (/sync brd); /sync sing toggles casting'))
+            end
             igSameLine(0, 4)
             if dn == '' then
                 igTextDisabled('--')
@@ -2937,7 +2958,7 @@ ashita.events.register('d3d_present', 'render_ui', function()
             else
                 igTextColored(don and STYLE_BTN.brd or COLOR_OFFLINE,
                     dn:sub(1,3):upper() .. (don and '' or '!'))
-                tip('Bard: ' .. dn .. (don and '' or ' - offline'))
+                if igIsItemHovered() then igSetTooltip('Bard: ' .. dn .. (don and '' or ' - offline')) end
             end
             -- Close X: right-justified to the window's right edge so it sits
             -- in the top-right corner regardless of how wide the table grows
@@ -4037,6 +4058,9 @@ end
 -- Ashita v4's binding returns ImVec2 either as separate (x,y) values or as a
 -- userdata/table with .x / [1]. Probe all three shapes and fall back to a
 -- modest SameLine(0, 12) gap if nothing works -- the cursor still advances.
+-- OPT: hoisted so right_align (called every frame in render_ui) never builds a
+-- closure on the userdata-ImVec2 binding path; r1 is passed as an arg instead.
+function geo_mod._probe_x(v) return v.x end
 function geo_mod.right_align(item_width)
     imgui.SameLine()
     local avail_x = nil
@@ -4044,7 +4068,7 @@ function geo_mod.right_align(item_width)
     if type(r1) == 'number' then
         avail_x = r1
     elseif r1 ~= nil then
-        local ok, v = pcall(function() return r1.x end)
+        local ok, v = pcall(geo_mod._probe_x, r1)
         if ok and v then avail_x = v
         elseif type(r1) == 'table' then avail_x = r1[1] end
     end
@@ -4131,17 +4155,16 @@ function geo_mod.brd.set_sing(on)
     settings.save()
 end
 
--- Marcato is still a SINGLE across the whole playlist (long recast) -- turning it
--- on for one row clears it off every OTHER row. Marcato and Pianissimo are NO
--- LONGER mutually exclusive ON THE SAME ROW: both may be set together for the
--- (rare) Marcato'd single-target song. check_song handles that fine -- it fires
--- Marcato, then Pianissimo, then casts the song ST at the row target. Enabling
--- one no longer clears the other.
+-- Marcato is a single across the whole playlist (checking it on one row clears
+-- it on the others). Marcato and Pianissimo are NOT mutually exclusive on a
+-- row: both may be checked so a single-target (Pianissimo) song can also be
+-- Marcato-boosted. The check_song cascade fires Marcato, then Pianissimo, then
+-- the ST song, so no runtime change is needed.
 function geo_mod.brd.set_marcato(i, on)
     local e = config.brd.songs[i]; if not e then return end
     if on then
         for j, other in ipairs(config.brd.songs) do if j ~= i then other.marcato = false end end
-        e.marcato = true   -- was also clearing e.pianissimo; no longer does
+        e.marcato = true
     else
         e.marcato = false
     end
@@ -4150,7 +4173,7 @@ end
 
 function geo_mod.brd.set_pianissimo(i, on)
     local e = config.brd.songs[i]; if not e then return end
-    e.pianissimo = on and true or false   -- was also clearing e.marcato; no longer does
+    if on then e.pianissimo = true else e.pianissimo = false end
     settings.save()
 end
 
