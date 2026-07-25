@@ -500,7 +500,7 @@ PRESETS
         /sync preset add <name> <flag> <target> [on|off]
         /sync preset rm <name> <row>       drop one row
         /sync preset del <name>            delete it
-        /sync preset reset                 restore the shipped pair
+        /sync preset reset                 clear them all
 
     SAVE captures the live flags of every IN-ZONE box and writes
     them as explicit on/off, never as toggles -- a toggle row flips
@@ -523,8 +523,10 @@ PRESETS
     'hunt' would shadow /sync hunt with no way back short of
     editing settings.lua -- save refuses those names.
 
-    Shipped: cb and bc, both 'buf all + heal all'. Delete or
-    overwrite them; /sync preset reset puts them back.
+    NOTHING ships as a preset. Older settings.lua files carry 'cb'
+    and 'bc' -- identical 'buf all + heal all' rows from before the
+    arm plan existed. They are left in place on upgrade and still
+    run, but they are not defaults; /sync preset del cb clears one.
 
 
 ================================================================
