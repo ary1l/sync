@@ -333,7 +333,7 @@ Presets            A named list of flag rows -- much smaller than
                      /sync preset add <name> <flag> <target> [on|off]
                      /sync preset rm <name> <row>
                      /sync preset del <name>
-                     /sync preset reset            shipped pair back
+                     /sync preset reset            clear them all
 
 --- LIMITS ------------------------------------------------------
 Crew               18 boxes (a full alliance). Edit in the Crew
@@ -393,13 +393,19 @@ Box isn't weaponskilling
     crew row's W cell.
 
 An Accession buff takes forever to go up
-    Every Accession costs a stratagem charge, and a SUB job is
-    capped at half the main's level -- so /SCH tops out at 49 and
-    gets TWO charges at 120s each. Below sub 30 it is ONE charge
-    at 240s: a RDM/SCH at 59 (sub 29) has a single four-minute
-    charge. Only a MAIN SCH gets the full five. Protect and Shell
-    are ordered ahead of Phalanx / Enspell for exactly that
-    reason. Check the charge count before assuming a fault.
+    Every Accession costs a stratagem charge, and charges come
+    from the SUB job's level -- 1 below 30, 2 at 30, 3 at 50 --
+    with the recast being 240s split across them (240 / 120 / 80).
+
+    Sub level is half the main job's, PLUS Master Levels: the sub
+    cap is 49 + ML/5, so ML5 puts /SCH at 50 and unlocks the third
+    charge, and ML50 reaches 59. Four and five charges are MAIN
+    SCH only. A pre-master RDM/SCH sits at 2 charges; a RDM/SCH at
+    main 59 (sub 29) has a single four-minute charge.
+
+    Protect and Shell are ordered ahead of Phalanx / Enspell for
+    exactly that reason. Check the charge count before assuming a
+    fault.
 
 A buff row never fires
     /sync sch5dbg names the gate that stopped it -- no caster,
